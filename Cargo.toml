@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/events", "crates/indexer", "crates/schema"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+bcs = "0.1.6"
+clap = { version = "4.5", features = ["derive", "env"] }
+diesel = "2.3"
+diesel-async = "0.9"
+diesel_migrations = "2.3"
+hex = "0.4"
+num-bigint = "0.4"
+prometheus = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = "1.47"
+tracing = "0.1"
+url = "2.5"
+
+perp-events = { path = "crates/events" }
+perp-schema = { path = "crates/schema" }
+
+# Haneul is pinned to one commit so that the framework, the checkpoint types and the node this
+# indexer reads from stay in step. Move every entry together.
+haneul-field-count = { git = "https://github.com/GeunhwaJeong/haneul", rev = "71a73158707ee7ebcbee95229856da129311fa93" }
+haneul-indexer-alt-framework = { git = "https://github.com/GeunhwaJeong/haneul", rev = "71a73158707ee7ebcbee95229856da129311fa93" }
+haneul-indexer-alt-metrics = { git = "https://github.com/GeunhwaJeong/haneul", rev = "71a73158707ee7ebcbee95229856da129311fa93" }
+haneul-pg-db = { git = "https://github.com/GeunhwaJeong/haneul", rev = "71a73158707ee7ebcbee95229856da129311fa93" }
+haneul-types = { git = "https://github.com/GeunhwaJeong/haneul", rev = "71a73158707ee7ebcbee95229856da129311fa93" }
+move-core-types = { git = "https://github.com/GeunhwaJeong/haneul", rev = "71a73158707ee7ebcbee95229856da129311fa93" }
+telemetry-subscribers = { git = "https://github.com/GeunhwaJeong/haneul", rev = "71a73158707ee7ebcbee95229856da129311fa93" }

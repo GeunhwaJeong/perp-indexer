@@ -1,0 +1,79 @@
+# perpetuals_orders::events at perp-dex 005b8136cefbbe1efa64a2b04272191b1eb6aacc
+
+CreatedStopOrderTicket
+  ticket_id: ID
+  account_id: u64
+  executors: vector<address>
+  execution_domain: Option<address>
+  gas: u64
+  stop_order_type: u64
+  encrypted_details: vector<u8>
+
+ExecutedStopOrderTicket
+  ticket_id: ID
+  account_id: u64
+  executor: address
+
+DeletedStopOrderTicket
+  ticket_id: ID
+  account_id: u64
+  executor: address
+
+EditedStopOrderTicketDetails
+  ticket_id: ID
+  account_id: u64
+  encrypted_details: vector<u8>
+
+EditedStopOrderTicketExecutors
+  ticket_id: ID
+  account_id: u64
+  executors: vector<address>
+
+CreatedTWAPOrderTicket
+  ticket_id: ID
+  ch_id: ID
+  account_id: u64
+  executors: vector<address>
+  execution_domain: Option<address>
+  gas: u64
+  encrypted_details: vector<u8>
+
+ProcessedTWAPOrderTicket
+  ticket_id: ID
+  account_id: u64
+  execution_amount: u64
+  filled_amount: u64
+  remainder: u64
+  processed_amount: u64
+  scheduled_amount: u64
+  last_attempt_timestamp_ms: u64
+  retry_anchor_timestamp_ms: u64
+  last_execution_timestamp_ms: u64
+
+FinalizedTWAPOrderTicket
+  ticket_id: ID
+  account_id: u64
+  executor: address
+  deallocated_collateral: u64
+
+CanceledTWAPOrderTicket
+  ticket_id: ID
+  account_id: u64
+  sender: address
+  deallocated_collateral: u64
+  partial_fill: bool
+
+DeletedTWAPOrderTicket
+  ticket_id: ID
+  account_id: u64
+  executor: address
+
+EditedTWAPOrderTicketDetails
+  ticket_id: ID
+  account_id: u64
+  encrypted_details: vector<u8>
+
+EditedTWAPOrderTicketExecutors
+  ticket_id: ID
+  account_id: u64
+  executors: vector<address>

@@ -1,0 +1,77 @@
+# oracle_aggregator::events at perp-dex 005b8136cefbbe1efa64a2b04272191b1eb6aacc
+
+CreatedPriceFeedStorage
+  price_feed_storage_obj_id: ID
+  storage_id: u32
+  symbol: String
+
+CreatedSource
+  source_id: u16
+  source_object_id: ID
+
+UpgradedSourceVersion
+  source_id: u16
+  version: u64
+
+AddedAuthorization
+  source_id: u16
+
+RemovedAuthorization
+  source_id: u16
+
+CreatedPriceFeed
+  storage_id: u32
+  source_id: u16
+  price: u128
+  timestamp_ms: u64
+
+RemovedPriceFeed
+  storage_id: u32
+  source_id: u16
+
+UpdatedPriceFeed
+  storage_id: u32
+  source_id: u16
+  old_price: u128
+  old_timestamp_ms: u64
+  old_twap_price: u128
+  new_price: u128
+  new_timestamp_ms: u64
+  new_twap_price: u128
+
+UpdatedTwapPeriodMs
+  storage_id: u32
+  source_id: u16
+  old_twap_period_ms: u64
+  new_twap_period_ms: u64
+
+SetVendorRegistration
+  open: bool
+
+RegisteredVendor
+  vendor_key: TypeName
+  vendor_admin_cap_id: ID
+
+CreatedPackageRevokeVendorGuardianCap
+  cap_id: ID
+
+GuardianRevokedVendorAuthorityCap
+  vendor_key: TypeName
+  role: TypeName
+  cap_id: ID
+
+ReauthorizedVendorAdminCap
+  vendor_key: TypeName
+  cap_id: ID
+
+CreatedPackageFreezeGuardianCap
+  cap_id: ID
+
+Froze
+  id: ID
+  resume_version: u64
+  guardian_cap_id: ID
+
+Unfroze
+  id: ID
+  version: u64

@@ -1,0 +1,12 @@
+[package]
+name = "perp-schema"
+version = "0.1.0"
+license = "Apache-2.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+diesel = { workspace = true, features = ["postgres", "serde_json"] }
+diesel_migrations.workspace = true
+haneul-field-count.workspace = true
+serde_json.workspace = true

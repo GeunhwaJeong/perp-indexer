@@ -12,9 +12,9 @@ use haneul_indexer_alt_framework::postgres::handler::Handler;
 use haneul_indexer_alt_framework::types::effects::TransactionEffectsAPI;
 use haneul_indexer_alt_framework::types::event::Event;
 use haneul_indexer_alt_framework::types::full_checkpoint_content::Checkpoint;
-use perp_events::{EVENTS_MODULE, PerpEvent};
 use perp_schema::models::RawEvent;
 use perp_schema::schema::raw_events;
+use perp_types::{EVENTS_MODULE, PerpEvent};
 use tracing::error;
 
 use crate::metrics::IndexerMetrics;

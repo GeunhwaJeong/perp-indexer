@@ -12,6 +12,7 @@ use haneul_indexer_alt_framework::{Indexer, IndexerArgs};
 use haneul_indexer_alt_metrics::{MetricsArgs, MetricsService};
 use haneul_pg_db::DbArgs;
 use perp_indexer::handlers::raw_events::RawEvents;
+use perp_indexer::handlers::state::State;
 use perp_indexer::metrics::IndexerMetrics;
 use perp_indexer::packages::{PackageArg, Packages};
 use perp_schema::MIGRATIONS;
@@ -92,9 +93,12 @@ async fn main() -> anyhow::Result<()> {
 
     indexer
         .concurrent_pipeline(
-            RawEvents::new(packages, indexer_metrics),
+            RawEvents::new(packages.clone(), indexer_metrics),
             Default::default(),
         )
+        .await?;
+    indexer
+        .sequential_pipeline(State::new(packages), Default::default())
         .await?;
 
     let s_indexer = indexer.run().await?;

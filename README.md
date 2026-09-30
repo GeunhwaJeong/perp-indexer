@@ -18,10 +18,10 @@ account summaries), the REST and WebSocket API, and the market-making vault.
 
 | Path | What it is |
 |---|---|
-| `crates/events` | Typed decoders for the engine's events. No chain dependencies. |
+| `crates/types` | Typed decoders for the engine's events. No chain dependencies. |
 | `crates/schema` | Postgres schema and migrations. |
 | `crates/indexer` | The indexer binary, built on `haneul-indexer-alt-framework`. |
-| `scripts/extract_event_layouts.py` | Regenerates `crates/events/layouts` from an engine checkout. |
+| `scripts/extract_layouts.py` | Regenerates `crates/types/layouts` from an engine checkout. |
 | `scripts/reconcile_ledger.py` | Checks the ledger against a full node, event by event. |
 
 ## Running
@@ -62,11 +62,11 @@ the deployed package.
 Event payloads are BCS, which is positional: a field that is missing, reordered or mistyped
 shifts every value after it. Two checks guard against that.
 
-`cargo test` compares the Rust declarations in `crates/events` with the field layouts extracted
+`cargo test` compares the Rust declarations in `crates/types` with the field layouts extracted
 from the engine's Move sources. After the engine changes, refresh them:
 
 ```sh
-scripts/extract_event_layouts.py ~/perp-dex
+scripts/extract_layouts.py ~/perp-dex
 ```
 
 `scripts/reconcile_ledger.py` compares a running indexer with the chain. It reads every

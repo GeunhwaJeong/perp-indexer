@@ -15,7 +15,7 @@ in one of the given packages, and checks them against the ledger in both directi
   - for decoded rows, `data` equals the node's own rendering of the event.
 
 The last check compares two independent decoders: the node renders events from the layouts
-published on chain, the indexer from the layouts declared in crates/events.
+published on chain, the indexer from the layouts declared in crates/types.
 
 Needs grpcurl and psql. Pass --plaintext=false for a TLS endpoint. Exits non-zero on any
 mismatch.

@@ -1,4 +1,4 @@
-# perpetuals_orders::events at perp-dex 005b8136cefbbe1efa64a2b04272191b1eb6aacc
+# perpetuals_orders at perp-dex 005b8136cefbbe1efa64a2b04272191b1eb6aacc
 
 CreatedStopOrderTicket
   ticket_id: ID

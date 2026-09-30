@@ -1,13 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/events", "crates/indexer", "crates/schema"]
+members = ["crates/types", "crates/indexer", "crates/schema"]
 
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 bcs = "0.1.6"
+bigdecimal = "0.4"
 clap = { version = "4.5", features = ["derive", "env"] }
-diesel = "2.3"
+diesel = { version = "2.3", features = ["64-column-tables"] }
 diesel-async = "0.9"
 diesel_migrations = "2.3"
 hex = "0.4"
@@ -20,7 +21,7 @@ tokio = "1.47"
 tracing = "0.1"
 url = "2.5"
 
-perp-events = { path = "crates/events" }
+perp-types = { path = "crates/types" }
 perp-schema = { path = "crates/schema" }
 
 # Haneul is pinned to one commit so that the framework, the checkpoint types and the node this

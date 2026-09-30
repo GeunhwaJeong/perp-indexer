@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use move_core_types::account_address::AccountAddress;
-use perp_events::Package;
+use perp_types::Package;
 
 /// A `<name>=<address>` command line argument.
 #[derive(Clone, Debug)]

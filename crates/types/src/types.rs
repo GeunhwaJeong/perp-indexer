@@ -11,7 +11,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use num_bigint::BigUint;
+use num_bigint::{BigInt, BigUint};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -114,6 +114,11 @@ pub struct U256(pub [u8; 32]);
 impl U256 {
     pub fn to_biguint(&self) -> BigUint {
         BigUint::from_bytes_le(&self.0)
+    }
+
+    /// The value read as an `ifixed` number: two's complement, scaled by 10^18.
+    pub fn to_ifixed(&self) -> BigInt {
+        BigInt::from_signed_bytes_le(&self.0)
     }
 }
 

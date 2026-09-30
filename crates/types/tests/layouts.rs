@@ -1,19 +1,13 @@
 // Copyright (c) 2026 Geunhwa Jeong
 // SPDX-License-Identifier: Apache-2.0
 
-//! Checks the Rust event declarations against the layouts extracted from the engine's Move
-//! sources (`scripts/extract_event_layouts.py`). BCS decoding is positional, so a field that is
-//! missing, reordered or mistyped would silently shift every value after it.
+//! Checks the Rust declarations against the layouts extracted from the engine's Move sources
+//! (`scripts/extract_layouts.py`). BCS decoding is positional, so a field that is missing,
+//! reordered or mistyped would silently shift every value after it.
 
-use perp_events::Package;
+use perp_types::Package;
 
-fn layout_file(package: Package) -> &'static str {
-    match package {
-        Package::Perpetuals => include_str!("../layouts/perpetuals.layout"),
-        Package::PerpetualsOrders => include_str!("../layouts/perpetuals_orders.layout"),
-        Package::OracleAggregator => include_str!("../layouts/oracle_aggregator.layout"),
-    }
-}
+type Layout = Vec<(String, Vec<(String, String)>)>;
 
 /// The Rust type a Move field type must be declared as.
 fn rust_type(move_type: &str) -> String {
@@ -36,16 +30,18 @@ fn rust_type(move_type: &str) -> String {
     match move_type {
         "u128" => "U128",
         "u256" => "U256",
-        "ID" => "Id",
+        "ID" | "UID" => "Id",
         "address" => "Address",
+        // A balance is a struct around its `u64` value.
+        "Balance<T>" => "u64",
         other => other,
     }
     .to_owned()
 }
 
-fn expected(package: Package) -> Vec<(String, Vec<(String, String)>)> {
-    let mut events: Vec<(String, Vec<(String, String)>)> = vec![];
-    for line in layout_file(package).lines() {
+fn expected(layout_file: &str) -> Layout {
+    let mut events: Layout = vec![];
+    for line in layout_file.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -60,9 +56,8 @@ fn expected(package: Package) -> Vec<(String, Vec<(String, String)>)> {
     events
 }
 
-fn declared(package: Package) -> Vec<(String, Vec<(String, String)>)> {
-    package
-        .layout()
+fn declared(layout: &[(&str, &[(&str, &str)])]) -> Layout {
+    layout
         .iter()
         .map(|(name, fields)| {
             let fields = fields
@@ -75,14 +70,29 @@ fn declared(package: Package) -> Vec<(String, Vec<(String, String)>)> {
 }
 
 #[test]
-fn declarations_match_the_move_sources() {
+fn events_match_the_move_sources() {
     for package in Package::ALL {
-        let expected = expected(package);
+        let expected = expected(match package {
+            Package::Perpetuals => include_str!("../layouts/perpetuals.layout"),
+            Package::PerpetualsOrders => include_str!("../layouts/perpetuals_orders.layout"),
+            Package::OracleAggregator => include_str!("../layouts/oracle_aggregator.layout"),
+        });
         assert!(!expected.is_empty(), "{package}: empty layout file");
         assert_eq!(
-            declared(package),
+            declared(package.layout()),
             expected,
             "{package}: event layouts drifted"
         );
     }
+}
+
+#[test]
+fn objects_match_the_move_sources() {
+    let expected = expected(include_str!("../layouts/objects.layout"));
+    assert!(!expected.is_empty(), "empty layout file");
+    assert_eq!(
+        declared(perp_types::objects::LAYOUT),
+        expected,
+        "object layouts drifted"
+    );
 }

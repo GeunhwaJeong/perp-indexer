@@ -1,13 +1,12 @@
 // Copyright (c) 2026 Geunhwa Jeong
 // SPDX-License-Identifier: Apache-2.0
 
-/// Declares the events of one Move `events` module.
+/// Declares Rust mirrors of Move structs.
 ///
-/// For each `struct` this generates a Rust struct that decodes from the event's BCS payload, and
-/// for the module as a whole an `Event` enum, a by-name decoder and a `LAYOUT` table. BCS carries
-/// no field names, so a struct must list the same fields, in the same order, as its Move
-/// definition; `LAYOUT` is what the `layouts` test checks against the engine's sources.
-macro_rules! move_events {
+/// Each struct decodes from the BCS of its Move counterpart, which carries no field names: it
+/// must list the same fields, in the same order, as the Move definition. `LAYOUT` records what
+/// was declared so the `layouts` test can check it against the engine's sources.
+macro_rules! move_structs {
     ($( struct $name:ident { $( $field:ident : $ty:ty ),* $(,)? } )*) => {
         $(
             #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -15,6 +14,21 @@ macro_rules! move_events {
                 $( pub $field: $ty, )*
             }
         )*
+
+        /// Every struct with its `(field, type)` pairs in declaration order.
+        pub const LAYOUT: &[(&str, &[(&str, &str)])] = &[
+            $( (stringify!($name), &[ $( (stringify!($field), stringify!($ty)), )* ]), )*
+        ];
+    };
+}
+
+/// Declares the events of one Move `events` module: the structs (see [`move_structs`]), an
+/// `Event` enum over them and a decoder that picks the struct by name.
+macro_rules! move_events {
+    ($( struct $name:ident { $( $field:ident : $ty:ty ),* $(,)? } )*) => {
+        move_structs! {
+            $( struct $name { $( $field : $ty, )* } )*
+        }
 
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub enum Event {
@@ -43,10 +57,5 @@ macro_rules! move_events {
                 .expect("events serialize to JSON")
             }
         }
-
-        /// Every event struct with its `(field, type)` pairs in declaration order.
-        pub const LAYOUT: &[(&str, &[(&str, &str)])] = &[
-            $( (stringify!($name), &[ $( (stringify!($field), stringify!($ty)), )* ]), )*
-        ];
     };
 }

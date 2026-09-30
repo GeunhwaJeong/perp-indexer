@@ -1,5 +1,5 @@
 [package]
-name = "perp-events"
+name = "perp-types"
 version = "0.1.0"
 license = "Apache-2.0"
 publish = false

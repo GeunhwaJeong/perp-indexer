@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Geunhwa Jeong
 // SPDX-License-Identifier: Apache-2.0
 
-//! Typed decoders for the events of the perpetuals engine.
+//! Typed decoders for the events and objects of the perpetuals engine.
 //!
 //! The engine emits all of its events from a module called `events` in each package, so an event
 //! is identified by the package it belongs to and its struct name. This crate has no chain
@@ -13,6 +13,7 @@ use std::str::FromStr;
 #[macro_use]
 mod macros;
 
+pub mod objects;
 pub mod oracle_aggregator;
 pub mod perpetuals;
 pub mod perpetuals_orders;

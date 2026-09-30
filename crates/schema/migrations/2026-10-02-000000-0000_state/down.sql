@@ -1,0 +1,11 @@
+DROP TABLE order_tickets;
+DROP TABLE collateral_transfers;
+DROP TABLE funding_payments;
+DROP TABLE funding_updates;
+DROP TABLE candles;
+DROP TABLE fills;
+DROP TABLE orders;
+DROP TABLE positions;
+DROP TABLE accounts;
+DROP TABLE oracle_prices;
+DROP TABLE markets;

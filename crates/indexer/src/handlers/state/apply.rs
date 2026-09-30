@@ -245,7 +245,14 @@ async fn apply_ticket(change: &TicketChange, conn: &mut Connection<'_>) -> anyho
             checkpoint,
             timestamp_ms,
         } => {
+            // A ticket is deleted after it was executed, finalized or canceled, and that outcome
+            // is the status worth keeping: deletion only settles a ticket that is still open.
+            let any_status = diesel::dsl::sql::<diesel::sql_types::Bool>(match *status {
+                "deleted" => "FALSE",
+                _ => "TRUE",
+            });
             diesel::update(order_tickets::table.find(ticket_id))
+                .filter(t::status.eq("open").or(any_status))
                 .set((
                     t::status.eq(status),
                     t::updated_checkpoint.eq(checkpoint),

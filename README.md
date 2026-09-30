@@ -5,24 +5,32 @@ turns the engine's events into the data a trading front end needs.
 
 ## Status
 
-The first layer is in place: the **ledger**. Every event emitted by the indexed packages is
-recorded in `raw_events`, keyed by its position on chain `(checkpoint, tx_index, event_index)`,
-with the payload bytes exactly as emitted and, where a decoder exists, the decoded JSON. The
-ledger is append-only and idempotent, so it can be replayed from any checkpoint, and everything
-built on top of it can be rebuilt from it.
+Two of the four planned layers are in place.
 
-Still to come: the derived tables (orders, fills, positions, order book levels, candles, funding,
-account summaries), the REST and WebSocket API, and the market-making vault.
+The **ledger** (`raw_events`) records every event emitted by the indexed packages, keyed by its
+position on chain `(checkpoint, tx_index, event_index)`, with the payload bytes exactly as emitted
+and, where a decoder exists, the decoded JSON. It is append-only and idempotent, so it can be
+replayed from any checkpoint, and everything built on top of it can be rebuilt from it.
+
+The **state** tables are derived from the chain in order. Markets, accounts and positions are
+copied from the objects each transaction writes, so they hold exactly what the engine holds.
+Orders, fills, candles (seven resolutions), funding, collateral transfers and stop/TWAP order
+tickets are built from events. Every batch of checkpoints is written in one transaction together
+with the pipeline's watermark, so it is applied exactly once.
+
+Still to come: the REST and WebSocket API, and decoders for the market-making vault.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `crates/types` | Typed decoders for the engine's events. No chain dependencies. |
+| `crates/types` | Typed decoders for the engine's events and state objects. No chain dependencies. |
 | `crates/schema` | Postgres schema and migrations. |
 | `crates/indexer` | The indexer binary, built on `haneul-indexer-alt-framework`. |
 | `scripts/extract_layouts.py` | Regenerates `crates/types/layouts` from an engine checkout. |
 | `scripts/reconcile_ledger.py` | Checks the ledger against a full node, event by event. |
+| `scripts/check_state.py` | Checks the state tables against the node's objects and against each other. |
+| `scripts/localnet/` | A scenario that drives a local network through every engine path, and a script that runs the whole pass. |
 
 ## Running
 
@@ -79,6 +87,28 @@ scripts/reconcile_ledger.py \
   --grpc 127.0.0.1:9000 \
   --package perpetuals=0x... --package oracle_aggregator=0x...
 ```
+
+`scripts/check_state.py` does the same for the state tables. Positions, markets and accounts are
+compared with the node's rendering of their objects, and the tables built from events are
+compared with them: open orders against a position's resting quantities and pending order count,
+fills against its size, transfers against an account's balance, the top of the book and the open
+interest against the market, candles against trades.
+
+## Localnet pass
+
+`scripts/localnet/run_all.sh` starts a throwaway network, publishes the engine from a copy of its
+checkout, starts the indexer at the tip and, while it streams, runs `scripts/localnet/scenario.py`:
+administrator parameter changes, integrator fees, stop and TWAP tickets through every step of
+their life, a liquidation whose bad debt is socialized and an auto-deleveraging. It ends with the
+two checks above.
+
+```sh
+scripts/localnet/run_all.sh <work dir> <engine checkout copy> <haneul binary> postgres://localhost:5432/perp_indexer_localnet
+```
+
+The engine's own suite (`e2e/localnet_e2e.py` in its checkout) covers the rest: settlement,
+funding, fee withdrawal and the vault. Run the indexer over a network it ran on and apply the same
+two checks.
 
 ## Dependencies
 

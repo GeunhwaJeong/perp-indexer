@@ -6,11 +6,24 @@
 
     scripts/localnet/scenario.py publish --perp-dex <checkout>   # prints the --package list
     scripts/localnet/scenario.py run     --perp-dex <checkout>   # everything else
+    scripts/localnet/scenario.py price   --perp-dex <checkout> --usd <price>
+
+`run` takes three optional paths that let the API be checked alongside the indexer:
+`--deployment` is written as soon as the market exists (the file the API lists its markets
+from), `--gate` is then waited for, so the API and its subscribers can be started before
+anything trades, and `--probe` is written at the end with the engine's own view of the mark
+price and of every position.
+
+The funding step waits for a funding interval to pass, which takes up to a minute.
+
+`price` moves the index price of the market `run` created. It is a cheap way to make the chain
+produce a change, for checks that need one after the scenario has finished.
 
 `publish` deploys the engine so the indexer can be started with the package addresses; `run`
 then sets up a market and produces, while the indexer is following the chain: administrator
 parameter changes, integrator fees, stop order and TWAP tickets through every step of their
-life, a liquidation whose bad debt is socialized, and an auto-deleveraging.
+life, a liquidation whose bad debt is socialized, a funding update that is settled for one
+account and left accrued for the others, and an auto-deleveraging.
 
 Reuses the helpers of the engine's own suite (`<checkout>/e2e/localnet_e2e.py`), which must
 point at the checkout the packages are published from. Needs a running localnet, the CLI on the
@@ -22,6 +35,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 STATE_FILE = Path(".localnet-scenario.json")
@@ -143,7 +157,7 @@ def publish(lib):
     print("\n--package " + " --package ".join(f"{n}={p}" for n, p in packages.items()))
 
 
-def run(lib):
+def run(lib, deployment_path=None, gate_path=None, probe_path=None):
     lib.safety_check()
     state = json.loads(STATE_FILE.read_text())
     P, ids = state["packages"], state["publish_tx"]
@@ -220,6 +234,26 @@ def run(lib):
     j = ptb("create BTC/USD clearing house", cmds)
     ch = lib.shared_created(j, f"::clearing_house::ClearingHouse<{TUSD}>")
     check("clearing house created", len(events(j, "::events::CreatedClearingHouse")) == 1)
+
+    # What `price` needs to move the index price later.
+    state["oracle"] = {"source": source, "config": oracle_config, "pfs_btc": pfs_btc, "pfs_tusd": pfs_tusd}
+    STATE_FILE.write_text(json.dumps(state))
+
+    if deployment_path:
+        deployment = {
+            "network": "localnet",
+            "collateral": {"coinType": TUSD, "decimals": 6},
+            "markets": {"BTC-USD": {"marketId": "BTC-USD", "clearingHouse": ch}},
+            "owner": me,
+        }
+        Path(deployment_path).write_text(json.dumps(deployment, indent=2))
+    if gate_path:
+        section(f"Waiting for {gate_path}")
+        deadline = time.time() + 300
+        while not Path(gate_path).exists():
+            if time.time() > deadline:
+                sys.exit(f"{gate_path} did not appear")
+            time.sleep(0.5)
 
     # ------------------------------------------------------------ administrator parameters
     section("Administrator parameter changes")
@@ -444,6 +478,27 @@ def run(lib):
     check("liquidation left bad debt", int(liquidated["bad_debt"]) > 0, liquidated["bad_debt"])
     check("SocializedBadDebt emitted", len(events(j, "::events::SocializedBadDebt")) == 1)
 
+    # ------------------------------------------------------------ funding
+    section("Funding")
+    # A book resting above the index gives the premium TWAP something to sample, so the next
+    # funding interval charges the longs (T and L) and pays the short (M).
+    ladder(85_500)
+    time.sleep(2)
+    cmds = refresh_prices() + call(f"{PERP}::clearing_house::update_twaps", [TUSD], obj(ch), obj(pfs_btc), CLOCK)
+    j = ptb("anyone samples the TWAPs with the book above the index", cmds)
+    check("UpdatedPremiumTwap emitted", len(events(j, "::events::UpdatedPremiumTwap")) == 1)
+    funding_frequency_ms = 60_000
+    time.sleep((funding_frequency_ms - time.time() * 1000 % funding_frequency_ms + 2_000) / 1000)
+    cmds = refresh_prices() + call(f"{PERP}::clearing_house::update_funding", [TUSD], obj(ch), obj(pfs_btc), CLOCK)
+    j = ptb("anyone updates funding once the interval has passed", cmds)
+    check("UpdatedFunding emitted", len(events(j, "::events::UpdatedFunding")) == 1)
+    # T is brought current. L is not touched again: what it accrued stays unsettled, and only
+    # the funding update itself tells an observer that its balance changed.
+    cmds = refresh_prices() + call(f"{PERP}::clearing_house::settle_position_funding", [TUSD], obj(ch), obj(pfs_tusd), u64(acct["T"]["id"]), CLOCK)
+    j = ptb("anyone settles T's funding", cmds)
+    settled = events(j, "::events::SettledFunding")
+    check("T paid funding", len(settled) == 1 and lib.signed(settled[0]["collateral_change_usd"]) < 0, str(settled))
+
     # ------------------------------------------------------------ auto-deleveraging
     section("Auto-deleveraging")
     # T is long about 0.3 BTC on 20,000 of collateral: at 30,000 its equity is negative.
@@ -458,10 +513,42 @@ def run(lib):
     j = ptb("ADL closes T against M at 30,000", cmds)
     check("PerformedADL emitted", len(events(j, "::events::PerformedADL")) == 1)
 
+    if probe_path:
+        # What the engine itself says, without touching the chain: the mark price as of now and
+        # each position with the funding it has accrued. Raw fixed-point integers.
+        cmds = call(f"{E2E}::probe::mark", [TUSD], obj(ch), obj(pfs_btc), CLOCK)
+        for a in acct.values():
+            cmds += call(f"{E2E}::probe::position", [TUSD], obj(ch), u64(a["id"]))
+            cmds += call(f"{E2E}::probe::account", [TUSD], obj(a["obj"]))
+        j = lib.simulate("probe", cmds)
+        probe = {
+            "mark_price": str(lib.signed(events(j, "::probe::MarkSnapshot")[0]["mark_price"])),
+            "accounts": {},
+        }
+        balances = {int(e["account_id"]): e["collateral"] for e in events(j, "::probe::AccountSnapshot")}
+        for e in events(j, "::probe::PositionSnapshot"):
+            probe["accounts"][str(e["account_id"])] = {
+                "balance": str(balances[int(e["account_id"])]),
+                "collateral": str(lib.signed(e["collateral"])),
+                "base": str(lib.signed(e["base"])),
+                "quote": str(lib.signed(e["quote"])),
+                "unsettled_funding": str(lib.signed(e["unsettled_funding"])),
+            }
+        Path(probe_path).write_text(json.dumps(probe, indent=2))
+
     failed = [n for n, ok in lib.RESULTS if not ok]
     print(f"\n{len(lib.RESULTS) - len(failed)}/{len(lib.RESULTS)} checks passed")
     if failed:
         sys.exit(1)
+
+
+def price(lib, usd):
+    """Sets the index price of the scenario's market, which moves its mark price."""
+    lib.safety_check()
+    state = json.loads(STATE_FILE.read_text())
+    E2E, o = state["packages"]["perp_e2e"], state["oracle"]
+    cmds = lib.call(f"{E2E}::mock_source::set_price", [], lib.obj(o["source"]), lib.obj(o["config"]), lib.obj(o["pfs_btc"]), lib.u128(lib.fx(usd)), lib.CLOCK)
+    lib.ptb(f"index price to {usd:,}", cmds)
 
 
 def u32_(n):
@@ -470,12 +557,23 @@ def u32_(n):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=["publish", "run"])
+    parser.add_argument("command", choices=["publish", "run", "price"])
     parser.add_argument("--perp-dex", required=True, help="engine checkout the packages are published from")
+    parser.add_argument("--deployment", help="write the API's deployment file here once the market exists")
+    parser.add_argument("--gate", help="wait for this file before anything trades")
+    parser.add_argument("--probe", help="write the engine's view of prices and positions here at the end")
+    parser.add_argument("--usd", type=int, help="the index price to set, for `price`")
     args = parser.parse_args()
     lib = load_lib(args.perp_dex)
+    # Resolved before changing directory, which the engine's helpers need.
+    paths = [str(Path(p).resolve()) if p else None for p in (args.deployment, args.gate, args.probe)]
     os.chdir(Path(args.perp_dex).expanduser())
-    (publish if args.command == "publish" else run)(lib)
+    if args.command == "publish":
+        publish(lib)
+    elif args.command == "price":
+        price(lib, args.usd)
+    else:
+        run(lib, *paths)
 
 
 if __name__ == "__main__":

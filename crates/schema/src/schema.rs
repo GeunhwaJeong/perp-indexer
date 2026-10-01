@@ -63,6 +63,7 @@ diesel::table! {
         index_price -> Nullable<Numeric>,
         book_price -> Nullable<Numeric>,
         prices_updated_at_ms -> Nullable<Int8>,
+        market_index -> Nullable<Int8>,
     }
 }
 
@@ -109,6 +110,15 @@ diesel::table! {
         created_at_ms -> Int8,
         updated_checkpoint -> Int8,
         updated_at_ms -> Int8,
+        opened_checkpoint -> Nullable<Int8>,
+        opened_at_ms -> Nullable<Int8>,
+        max_size -> Numeric,
+        sum_open -> Numeric,
+        sum_close -> Numeric,
+        close_quote -> Numeric,
+        entry_quote -> Numeric,
+        realized_pnl -> Numeric,
+        net_funding -> Numeric,
     }
 }
 
@@ -161,6 +171,8 @@ diesel::table! {
         order_id -> Nullable<Numeric>,
         client_order_id -> Nullable<Numeric>,
         mark_price -> Nullable<Numeric>,
+        position_base_before -> Nullable<Numeric>,
+        entry_price_before -> Nullable<Numeric>,
     }
 }
 
@@ -189,6 +201,7 @@ diesel::table! {
         cum_funding_rate_long -> Numeric,
         cum_funding_rate_short -> Numeric,
         funding_last_upd_ms -> Int8,
+        index_price -> Nullable<Numeric>,
     }
 }
 
@@ -205,6 +218,8 @@ diesel::table! {
         collateral_after -> Numeric,
         cum_funding_rate_long -> Numeric,
         cum_funding_rate_short -> Numeric,
+        position_base -> Nullable<Numeric>,
+        index_price -> Nullable<Numeric>,
     }
 }
 
@@ -240,5 +255,15 @@ diesel::table! {
         created_at_ms -> Int8,
         updated_checkpoint -> Int8,
         updated_at_ms -> Int8,
+    }
+}
+
+diesel::table! {
+    account_caps (cap_id) {
+        cap_id -> Text,
+        account_object_id -> Text,
+        role -> Text,
+        owner -> Nullable<Text>,
+        updated_checkpoint -> Int8,
     }
 }

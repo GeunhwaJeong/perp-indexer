@@ -114,6 +114,11 @@ move_structs! {
         collateral: u64,
         active_assistants: Vec<Id>,
     }
+
+    struct AuthorityCap {
+        id: Id,
+        r#for: Id,
+    }
 }
 
 /// A dynamic field object, `0x2::dynamic_field::Field<Name, Value>`.

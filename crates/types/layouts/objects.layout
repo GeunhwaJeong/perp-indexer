@@ -91,3 +91,7 @@ Account
   account_id: u64
   collateral: Balance<T>
   active_assistants: vector<ID>
+
+AuthorityCap
+  id: UID
+  for: ID

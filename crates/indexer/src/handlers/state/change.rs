@@ -3,8 +3,8 @@
 
 use bigdecimal::BigDecimal;
 use perp_schema::models::{
-    AccountSnapshot, CollateralTransfer, Fill, FundingPayment, FundingUpdate, MarketSnapshot,
-    OraclePrice, Order, OrderTicket, PositionSnapshot,
+    AccountCap, AccountSnapshot, CollateralTransfer, Fill, FundingPayment, FundingUpdate,
+    MarketSnapshot, OraclePrice, Order, OrderTicket, PositionSnapshot,
 };
 
 /// One effect of a checkpoint on the derived state.
@@ -36,6 +36,11 @@ pub enum Change {
         creator: String,
         checkpoint: i64,
         timestamp_ms: i64,
+    },
+    AccountCap(AccountCap),
+    AccountCapRemoved {
+        cap_id: String,
+        checkpoint: i64,
     },
     PositionSnapshot(PositionSnapshot),
     OrderPosted(Order),

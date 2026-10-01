@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Geunhwa Jeong
 // SPDX-License-Identifier: Apache-2.0
 
-//! The state pipeline: markets, accounts, positions, orders, fills, candles, funding, collateral
-//! transfers and order tickets, maintained in chain order.
+//! The state pipeline: markets, accounts and their capabilities, positions, orders, fills,
+//! candles, funding, collateral transfers and order tickets, maintained in chain order.
 //!
 //! Unlike the ledger, these tables depend on the order changes are applied in, so the pipeline is
 //! sequential: every batch of checkpoints is written in one database transaction together with
@@ -20,6 +20,7 @@ use crate::packages::Packages;
 mod apply;
 pub mod batch;
 pub mod change;
+pub mod episode;
 pub mod extract;
 
 pub struct State {

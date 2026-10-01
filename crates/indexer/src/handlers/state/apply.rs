@@ -4,18 +4,24 @@
 //! Writes a batch to the database. The caller runs this inside the transaction that also advances
 //! the pipeline's watermark, so a batch is applied exactly once.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use bigdecimal::BigDecimal;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Nullable, Numeric, SmallInt, Text};
 use diesel::upsert::excluded;
 use diesel_async::RunQueryDsl;
 use haneul_indexer_alt_framework::postgres::Connection;
+use perp_schema::models::{Fill, FundingPayment, PositionEpisode};
 use perp_schema::schema::{
-    accounts, candles, collateral_transfers, fills, funding_payments, funding_updates, markets,
-    oracle_prices, order_tickets, orders, positions,
+    account_caps, accounts, candles, collateral_transfers, fills, funding_payments,
+    funding_updates, markets, oracle_prices, order_tickets, orders, positions,
 };
+use tracing::warn;
 
-use super::batch::Batch;
+use super::batch::{Batch, CapWrite};
 use super::change::TicketChange;
+use super::episode::{EpisodeState, PositionEvent};
 
 /// Rows per insert statement. Postgres allows 65535 bind parameters per statement, and the
 /// widest table written in bulk has 21 columns.
@@ -33,6 +39,17 @@ pub async fn commit(batch: &Batch, conn: &mut Connection<'_>) -> anyhow::Result<
             .set(snapshot)
             .execute(conn)
             .await?;
+    }
+    // New markets are numbered in the order they appeared on chain.
+    for market in &batch.market_order {
+        rows += diesel::sql_query(
+            "UPDATE markets \
+             SET market_index = (SELECT COALESCE(MAX(market_index), -1) + 1 FROM markets) \
+             WHERE market = $1 AND market_index IS NULL",
+        )
+        .bind::<Text, _>(market)
+        .execute(conn)
+        .await?;
     }
     for created in &batch.markets_created {
         rows += diesel::update(markets::table.find(&created.market))
@@ -102,7 +119,34 @@ pub async fn commit(batch: &Batch, conn: &mut Connection<'_>) -> anyhow::Result<
             .await?;
     }
 
-    // Positions.
+    for (cap_id, cap) in &batch.account_caps {
+        rows += match cap {
+            CapWrite::Held(cap) => {
+                diesel::insert_into(account_caps::table)
+                    .values(cap)
+                    .on_conflict(account_caps::cap_id)
+                    .do_update()
+                    .set(cap)
+                    .execute(conn)
+                    .await?
+            }
+            // The row stays, without an owner, so that readers following the table by
+            // checkpoint see the capability go.
+            CapWrite::Removed(checkpoint) => {
+                diesel::update(account_caps::table.find(cap_id))
+                    .set((
+                        account_caps::owner.eq(None::<String>),
+                        account_caps::updated_checkpoint.eq(checkpoint),
+                    ))
+                    .execute(conn)
+                    .await?
+            }
+        };
+    }
+
+    // Positions. Their running totals continue from where the previous batch left them, so
+    // those are read before the snapshots overwrite the sizes they were left at.
+    let (episodes, fills, funding_payments) = fold_episodes(batch, conn).await?;
     for write in batch.positions.values() {
         rows += diesel::insert_into(positions::table)
             .values((
@@ -113,6 +157,13 @@ pub async fn commit(batch: &Batch, conn: &mut Connection<'_>) -> anyhow::Result<
             .on_conflict((positions::market, positions::account_id))
             .do_update()
             .set(&write.snapshot)
+            .execute(conn)
+            .await?;
+    }
+
+    for ((market, account_id), state) in &episodes {
+        rows += diesel::update(positions::table.find((market, account_id)))
+            .set(&state.episode)
             .execute(conn)
             .await?;
     }
@@ -154,7 +205,7 @@ pub async fn commit(batch: &Batch, conn: &mut Connection<'_>) -> anyhow::Result<
     }
 
     // Fills and the candles built from them.
-    for chunk in batch.fills.chunks(CHUNK_ROWS) {
+    for chunk in fills.chunks(CHUNK_ROWS) {
         rows += diesel::insert_into(fills::table)
             .values(chunk)
             .on_conflict_do_nothing()
@@ -187,7 +238,7 @@ pub async fn commit(batch: &Batch, conn: &mut Connection<'_>) -> anyhow::Result<
             .execute(conn)
             .await?;
     }
-    for chunk in batch.funding_payments.chunks(CHUNK_ROWS) {
+    for chunk in funding_payments.chunks(CHUNK_ROWS) {
         rows += diesel::insert_into(funding_payments::table)
             .values(chunk)
             .on_conflict_do_nothing()
@@ -221,11 +272,123 @@ pub async fn commit(batch: &Batch, conn: &mut Connection<'_>) -> anyhow::Result<
         };
     }
 
+    // Funding rows whose checkpoint reported no index price take the one the market last
+    // reported, or the oracle's while the market has not reported any.
+    let unpriced_updates = batch
+        .funding_updates
+        .iter()
+        .filter(|update| update.index_price.is_none())
+        .map(|update| update.checkpoint)
+        .min();
+    let unpriced_payments = funding_payments
+        .iter()
+        .filter(|payment| payment.index_price.is_none())
+        .map(|payment| payment.checkpoint)
+        .min();
+    for (table, first) in [
+        ("funding_updates", unpriced_updates),
+        ("funding_payments", unpriced_payments),
+    ] {
+        let Some(first) = first else { continue };
+        rows += diesel::sql_query(format!(
+            "UPDATE {table} f SET index_price = COALESCE(m.index_price, o.price) \
+             FROM markets m \
+             LEFT JOIN oracle_prices o \
+                    ON o.storage_id = m.base_storage_id AND o.source_id = m.base_source_id \
+             WHERE f.market = m.market AND f.index_price IS NULL AND f.checkpoint >= $1"
+        ))
+        .bind::<BigInt, _>(first)
+        .execute(conn)
+        .await?;
+    }
+
     for change in &batch.tickets {
         rows += apply_ticket(change, conn).await?;
     }
 
     Ok(rows)
+}
+
+type Episodes = BTreeMap<(String, i64), EpisodeState>;
+
+/// Runs the batch's fills and funding payments through the running totals of their positions.
+///
+/// Returns the totals to store, and the fills and payments annotated with the position each
+/// found. Must be called before the batch's position snapshots are written.
+async fn fold_episodes(
+    batch: &Batch,
+    conn: &mut Connection<'_>,
+) -> anyhow::Result<(Episodes, Vec<Fill>, Vec<FundingPayment>)> {
+    let mut fills = batch.fills.clone();
+    let mut funding_payments = batch.funding_payments.clone();
+    let mut episodes = Episodes::new();
+    if batch.position_events.is_empty() {
+        return Ok((episodes, fills, funding_payments));
+    }
+
+    // Every position of the batch's accounts in the batch's markets: a superset of the ones
+    // needed, found with two short lists instead of a list of pairs.
+    let market_ids: BTreeSet<&str> = batch
+        .position_events
+        .keys()
+        .map(|(market, _)| market.as_str())
+        .collect();
+    let account_ids: Vec<i64> = batch
+        .position_events
+        .keys()
+        .map(|(_, account_id)| *account_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for chunk in account_ids.chunks(CHUNK_ROWS) {
+        let stored: Vec<(String, i64, BigDecimal, PositionEpisode)> = positions::table
+            .filter(positions::market.eq_any(&market_ids))
+            .filter(positions::account_id.eq_any(chunk))
+            .select((
+                positions::market,
+                positions::account_id,
+                positions::base,
+                PositionEpisode::as_select(),
+            ))
+            .load(conn)
+            .await?;
+        for (market, account_id, base, episode) in stored {
+            let key = (market, account_id);
+            if batch.position_events.contains_key(&key) {
+                episodes.insert(key, EpisodeState { base, episode });
+            }
+        }
+    }
+
+    for (key, events) in &batch.position_events {
+        let state = episodes.entry(key.clone()).or_default();
+        for event in events {
+            match *event {
+                PositionEvent::Fill(i) => state.apply_fill(&mut fills[i]),
+                PositionEvent::Funding(i) => state.apply_funding(&mut funding_payments[i]),
+            }
+        }
+        if let Some(write) = batch.positions.get(key) {
+            let snapshot = &write.snapshot;
+            let folded = state.base.clone();
+            if state.reconcile(
+                &snapshot.base,
+                &snapshot.quote_notional,
+                snapshot.updated_checkpoint,
+                snapshot.updated_at_ms,
+            ) {
+                warn!(
+                    market = key.0,
+                    account_id = key.1,
+                    %folded,
+                    object = %snapshot.base,
+                    checkpoint = snapshot.updated_checkpoint,
+                    "Fills do not add up to the position: totals reset to the object"
+                );
+            }
+        }
+    }
+    Ok((episodes, fills, funding_payments))
 }
 
 async fn apply_ticket(change: &TicketChange, conn: &mut Connection<'_>) -> anyhow::Result<usize> {

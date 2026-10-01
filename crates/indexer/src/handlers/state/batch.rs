@@ -9,11 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bigdecimal::{BigDecimal, Zero};
 use perp_schema::models::{
-    AccountSnapshot, Candle, CollateralTransfer, Fill, FundingPayment, FundingUpdate,
+    AccountCap, AccountSnapshot, Candle, CollateralTransfer, Fill, FundingPayment, FundingUpdate,
     MarketSnapshot, OraclePrice, Order, PositionSnapshot,
 };
 
 use super::change::{Change, MarketPrices, OrderUpdate, TicketChange};
+use super::episode::PositionEvent;
 
 /// Candle widths, in milliseconds: 1, 5, 15 and 30 minutes, 1 and 4 hours, 1 day.
 pub const RESOLUTIONS_MS: [i64; 7] = [
@@ -42,6 +43,13 @@ pub struct AccountCreated {
     pub timestamp_ms: i64,
 }
 
+/// The last thing a batch saw happen to a capability.
+pub enum CapWrite {
+    Held(AccountCap),
+    /// Deleted or wrapped, at this checkpoint.
+    Removed(i64),
+}
+
 /// A position's latest snapshot, with when the batch first saw it (its creation, if it is new).
 pub struct PositionWrite {
     pub snapshot: PositionSnapshot,
@@ -62,17 +70,22 @@ pub struct OrderDelta {
 #[derive(Default)]
 pub struct Batch {
     pub market_snapshots: BTreeMap<String, MarketSnapshot>,
+    /// Markets in the order the batch first saw them, which is the order new ones are numbered.
+    pub market_order: Vec<String>,
     pub markets_created: Vec<MarketCreated>,
     pub markets_closed: BTreeSet<String>,
     pub market_settlements: BTreeMap<String, MarketSettlement>,
     pub market_prices: BTreeMap<String, MarketPrices>,
     pub account_snapshots: BTreeMap<i64, AccountSnapshot>,
     pub accounts_created: Vec<AccountCreated>,
+    pub account_caps: BTreeMap<String, CapWrite>,
     pub positions: BTreeMap<(String, i64), PositionWrite>,
     /// Orders posted in this batch, already carrying any fills and cancelations that followed.
     pub new_orders: BTreeMap<OrderKey, Order>,
     pub order_deltas: BTreeMap<OrderKey, OrderDelta>,
     pub fills: Vec<Fill>,
+    /// Each position's fills and funding payments, in chain order.
+    pub position_events: BTreeMap<(String, i64), Vec<PositionEvent>>,
     pub candles: BTreeMap<(String, i64, i64), Candle>,
     pub funding_updates: Vec<FundingUpdate>,
     pub funding_payments: Vec<FundingPayment>,
@@ -98,8 +111,12 @@ impl Batch {
     pub fn push(&mut self, change: Change) {
         match change {
             Change::MarketSnapshot(snapshot) => {
-                self.market_snapshots
-                    .insert(snapshot.market.clone(), *snapshot);
+                let previous = self
+                    .market_snapshots
+                    .insert(snapshot.market.clone(), *snapshot.clone());
+                if previous.is_none() {
+                    self.market_order.push(snapshot.market);
+                }
             }
             Change::MarketCreated {
                 market,
@@ -155,6 +172,14 @@ impl Batch {
                 checkpoint,
                 timestamp_ms,
             }),
+            Change::AccountCap(cap) => {
+                self.account_caps
+                    .insert(cap.cap_id.clone(), CapWrite::Held(cap));
+            }
+            Change::AccountCapRemoved { cap_id, checkpoint } => {
+                self.account_caps
+                    .insert(cap_id, CapWrite::Removed(checkpoint));
+            }
             Change::PositionSnapshot(snapshot) => {
                 let key = (snapshot.market.clone(), snapshot.account_id);
                 match self.positions.get_mut(&key) {
@@ -178,10 +203,20 @@ impl Batch {
                 if fill.kind == "trade" && fill.liquidity == "maker" {
                     self.add_trade(&fill);
                 }
+                self.position_events
+                    .entry((fill.market.clone(), fill.account_id))
+                    .or_default()
+                    .push(PositionEvent::Fill(self.fills.len()));
                 self.fills.push(fill);
             }
             Change::FundingUpdate(update) => self.funding_updates.push(update),
-            Change::FundingPayment(payment) => self.funding_payments.push(payment),
+            Change::FundingPayment(payment) => {
+                self.position_events
+                    .entry((payment.market.clone(), payment.account_id))
+                    .or_default()
+                    .push(PositionEvent::Funding(self.funding_payments.len()));
+                self.funding_payments.push(payment);
+            }
             Change::CollateralTransfer(transfer) => self.collateral_transfers.push(transfer),
             Change::OraclePrice(price) => {
                 self.oracle_prices
@@ -346,6 +381,8 @@ mod tests {
             order_id: None,
             client_order_id: None,
             mark_price: None,
+            position_base_before: None,
+            entry_price_before: None,
         })
     }
 
@@ -387,6 +424,10 @@ mod tests {
         batch.push(trade(120_000, "101", "1"));
 
         assert_eq!(batch.fills.len(), 4);
+        assert_eq!(
+            batch.position_events[&("0xm".to_owned(), 1)],
+            (0..4).map(PositionEvent::Fill).collect::<Vec<_>>()
+        );
         let minute = &batch.candles[&("0xm".to_owned(), 60_000, 60_000)];
         assert_eq!(
             (&minute.open, &minute.high, &minute.low, &minute.close),

@@ -29,8 +29,8 @@ pub struct RawEvent {
 use bigdecimal::BigDecimal;
 
 use crate::schema::{
-    accounts, candles, collateral_transfers, fills, funding_payments, funding_updates, markets,
-    oracle_prices, order_tickets, orders, positions,
+    account_caps, accounts, candles, collateral_transfers, fills, funding_payments,
+    funding_updates, markets, oracle_prices, order_tickets, orders, positions,
 };
 
 /// The part of a market row that mirrors the clearing house object.
@@ -150,6 +150,8 @@ pub struct Fill {
     pub order_id: Option<BigDecimal>,
     pub client_order_id: Option<BigDecimal>,
     pub mark_price: Option<BigDecimal>,
+    pub position_base_before: Option<BigDecimal>,
+    pub entry_price_before: Option<BigDecimal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Queryable, Selectable, Insertable)]
@@ -178,6 +180,7 @@ pub struct FundingUpdate {
     pub cum_funding_rate_long: BigDecimal,
     pub cum_funding_rate_short: BigDecimal,
     pub funding_last_upd_ms: i64,
+    pub index_price: Option<BigDecimal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Queryable, Selectable, Insertable)]
@@ -194,6 +197,8 @@ pub struct FundingPayment {
     pub collateral_after: BigDecimal,
     pub cum_funding_rate_long: BigDecimal,
     pub cum_funding_rate_short: BigDecimal,
+    pub position_base: Option<BigDecimal>,
+    pub index_price: Option<BigDecimal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Queryable, Selectable, Insertable)]
@@ -240,4 +245,30 @@ pub struct OrderTicket {
     pub created_at_ms: i64,
     pub updated_checkpoint: i64,
     pub updated_at_ms: i64,
+}
+
+/// A capability over an account, as its object says and as it is owned.
+#[derive(Clone, Debug, PartialEq, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = account_caps, primary_key(cap_id), treat_none_as_null = true)]
+pub struct AccountCap {
+    pub cap_id: String,
+    pub account_object_id: String,
+    pub role: String,
+    pub owner: Option<String>,
+    pub updated_checkpoint: i64,
+}
+
+/// The running totals of a position since it was last opened.
+#[derive(Clone, Debug, Default, PartialEq, Queryable, Selectable, AsChangeset)]
+#[diesel(table_name = positions, primary_key(market, account_id), treat_none_as_null = true)]
+pub struct PositionEpisode {
+    pub opened_checkpoint: Option<i64>,
+    pub opened_at_ms: Option<i64>,
+    pub max_size: BigDecimal,
+    pub sum_open: BigDecimal,
+    pub sum_close: BigDecimal,
+    pub close_quote: BigDecimal,
+    pub entry_quote: BigDecimal,
+    pub realized_pnl: BigDecimal,
+    pub net_funding: BigDecimal,
 }

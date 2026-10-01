@@ -3,6 +3,8 @@
 
 //! Turns a checkpoint into the changes it makes to the derived state.
 
+use std::collections::HashSet;
+
 use anyhow::Context;
 use bigdecimal::{BigDecimal, Zero};
 use haneul_indexer_alt_framework::types::effects::TransactionEffectsAPI;
@@ -11,10 +13,10 @@ use haneul_indexer_alt_framework::types::object::{Object, Owner};
 use move_core_types::account_address::AccountAddress;
 use move_core_types::language_storage::{StructTag, TypeTag};
 use perp_schema::models::{
-    AccountSnapshot, CollateralTransfer, Fill, FundingPayment, FundingUpdate, MarketSnapshot,
-    OraclePrice, Order, OrderTicket, PositionSnapshot,
+    AccountCap, AccountSnapshot, CollateralTransfer, Fill, FundingPayment, FundingUpdate,
+    MarketSnapshot, OraclePrice, Order, OrderTicket, PositionSnapshot,
 };
-use perp_types::objects::{Account, ClearingHouse, PositionField};
+use perp_types::objects::{Account, AuthorityCap, ClearingHouse, PositionField};
 use perp_types::types::{Address, U256};
 use perp_types::{
     DecodeError, EVENTS_MODULE, Package, PerpEvent, oracle_aggregator, perpetuals,
@@ -89,9 +91,23 @@ pub fn changes(checkpoint: &Checkpoint, packages: &Packages) -> anyhow::Result<V
             }
         }
 
+        let mut written = HashSet::new();
         for object in tx.output_objects(&checkpoint.object_set) {
+            written.insert(object.id());
             object_snapshot(sequence_number, timestamp_ms, object, packages, &mut out)
                 .with_context(|| format!("object {} written by {tx_digest}", object.id()))?;
+        }
+        // A capability the transaction read but did not write back was deleted or wrapped.
+        for object in tx.input_objects(&checkpoint.object_set) {
+            let is_cap = object
+                .struct_tag()
+                .is_some_and(|tag| account_cap_role(&tag, packages).is_some());
+            if is_cap && !written.contains(&object.id()) {
+                out.push(Change::AccountCapRemoved {
+                    cap_id: object.id().to_canonical_string(/* with_prefix */ true),
+                    checkpoint: sequence_number,
+                });
+            }
         }
     }
     Ok(out)
@@ -108,6 +124,14 @@ fn id(address: &Address) -> String {
 /// `quote / size`, the price a fill executed at. `None` for an empty fill.
 fn price_of(quote: &BigDecimal, size: &BigDecimal) -> Option<BigDecimal> {
     (!size.is_zero()).then(|| (quote / size).round(18))
+}
+
+/// The index price the checkpoint's events have reported for `market` so far, if any.
+fn last_index_price(changes: &[Change], market: &str) -> Option<BigDecimal> {
+    changes.iter().rev().find_map(|change| match change {
+        Change::MarketPrices(prices) if prices.market == market => prices.index_price.clone(),
+        _ => None,
+    })
 }
 
 fn perpetuals_event(
@@ -164,6 +188,8 @@ fn perpetuals_event(
             order_id: None,
             client_order_id: None,
             mark_price: None,
+            position_base_before: None,
+            entry_price_before: None,
         })
     };
 
@@ -418,29 +444,40 @@ fn perpetuals_event(
             }
         }
 
-        E::UpdatedFunding(e) => out.push(Change::FundingUpdate(FundingUpdate {
-            checkpoint: ctx.checkpoint,
-            tx_index: ctx.tx_index,
-            event_index: ctx.event_index,
-            timestamp_ms: ctx.timestamp_ms,
-            market: id(&e.ch_id),
-            cum_funding_rate_long: ifixed(&e.cum_funding_rate_long),
-            cum_funding_rate_short: ifixed(&e.cum_funding_rate_short),
-            funding_last_upd_ms: int8(e.funding_last_upd_ms)?,
-        })),
-        E::SettledFunding(e) => out.push(Change::FundingPayment(FundingPayment {
-            checkpoint: ctx.checkpoint,
-            tx_index: ctx.tx_index,
-            event_index: ctx.event_index,
-            tx_digest: ctx.tx_digest.to_owned(),
-            timestamp_ms: ctx.timestamp_ms,
-            market: id(&e.ch_id),
-            account_id: int8(e.account_id)?,
-            collateral_change_usd: ifixed(&e.collateral_change_usd),
-            collateral_after: ifixed(&e.collateral_after),
-            cum_funding_rate_long: ifixed(&e.mkt_funding_rate_long),
-            cum_funding_rate_short: ifixed(&e.mkt_funding_rate_short),
-        })),
+        // Funding is expressed as a rate of the index price. The TWAP events sampled just before
+        // carry it; when none was due, it is filled in from the market's row.
+        E::UpdatedFunding(e) => {
+            let market = id(&e.ch_id);
+            out.push(Change::FundingUpdate(FundingUpdate {
+                checkpoint: ctx.checkpoint,
+                tx_index: ctx.tx_index,
+                event_index: ctx.event_index,
+                timestamp_ms: ctx.timestamp_ms,
+                index_price: last_index_price(out, &market),
+                market,
+                cum_funding_rate_long: ifixed(&e.cum_funding_rate_long),
+                cum_funding_rate_short: ifixed(&e.cum_funding_rate_short),
+                funding_last_upd_ms: int8(e.funding_last_upd_ms)?,
+            }));
+        }
+        E::SettledFunding(e) => {
+            let market = id(&e.ch_id);
+            out.push(Change::FundingPayment(FundingPayment {
+                checkpoint: ctx.checkpoint,
+                tx_index: ctx.tx_index,
+                event_index: ctx.event_index,
+                tx_digest: ctx.tx_digest.to_owned(),
+                timestamp_ms: ctx.timestamp_ms,
+                index_price: last_index_price(out, &market),
+                market,
+                account_id: int8(e.account_id)?,
+                collateral_change_usd: ifixed(&e.collateral_change_usd),
+                collateral_after: ifixed(&e.collateral_after),
+                cum_funding_rate_long: ifixed(&e.mkt_funding_rate_long),
+                cum_funding_rate_short: ifixed(&e.mkt_funding_rate_short),
+                position_base: None,
+            }));
+        }
 
         // Market parameters, open interest, margin settings and the like are read from the
         // objects the transaction wrote, not from these events.
@@ -585,8 +622,22 @@ fn is_perpetuals_type(tag: &StructTag, packages: &Packages, module: &str, name: 
             .is_some_and(|package| package.decoder == Some(Package::Perpetuals))
 }
 
-/// Snapshots `object` if it is one the state is read from: a clearing house, an account, or a
-/// position (a dynamic field of its clearing house).
+/// The role of an account capability, `AuthorityCap<perpetuals::authority::ACCOUNT, Role>`, or
+/// `None` if `tag` is any other type. The capability type itself lives in a package of its own,
+/// so it is recognized by what it is a capability over.
+fn account_cap_role(tag: &StructTag, packages: &Packages) -> Option<String> {
+    if tag.module.as_str() != "authority" || tag.name.as_str() != "AuthorityCap" {
+        return None;
+    }
+    let [TypeTag::Struct(context), TypeTag::Struct(role)] = tag.type_params.as_slice() else {
+        return None;
+    };
+    is_perpetuals_type(context, packages, "authority", "ACCOUNT")
+        .then(|| role.name.as_str().to_ascii_lowercase())
+}
+
+/// Snapshots `object` if it is one the state is read from: a clearing house, an account, a
+/// capability over an account, or a position (a dynamic field of its clearing house).
 fn object_snapshot(
     checkpoint: i64,
     timestamp_ms: i64,
@@ -644,6 +695,21 @@ fn object_snapshot(
             collateral: integer(account.collateral),
             updated_checkpoint: checkpoint,
             updated_at_ms: timestamp_ms,
+        }));
+    } else if let Some(role) = account_cap_role(&tag, packages) {
+        let cap: AuthorityCap = bcs::from_bytes(contents).context("decoding AuthorityCap")?;
+        let owner = match object.owner() {
+            Owner::AddressOwner(owner) => {
+                Some(AccountAddress::from(*owner).to_canonical_string(/* with_prefix */ true))
+            }
+            _ => None,
+        };
+        out.push(Change::AccountCap(AccountCap {
+            cap_id: id(&cap.id),
+            account_object_id: id(&cap.r#for),
+            role,
+            owner,
+            updated_checkpoint: checkpoint,
         }));
     } else if tag.address == AccountAddress::TWO
         && tag.module.as_str() == "dynamic_field"

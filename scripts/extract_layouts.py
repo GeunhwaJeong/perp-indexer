@@ -33,6 +33,7 @@ LAYOUTS = {
         ("perpetuals/sources/orderbook.move", ["Orderbook"]),
         ("perpetuals/sources/clearing_house.move", ["ClearingHouse"]),
         ("perpetuals/sources/account.move", ["Account"]),
+        ("authority_cap/sources/authority.move", ["AuthorityCap"]),
     ],
 }
 STRUCT = re.compile(r"public struct (\w+)(?:<[^>]*>)?\s+has[^{]*\{([^}]*)\}")
@@ -42,7 +43,8 @@ def layouts(source: str):
     source = re.sub(r"//[^\n]*", "", source)
     for name, body in STRUCT.findall(source):
         fields = [f.strip() for f in body.split(",") if f.strip()]
-        yield name, [tuple(part.strip() for part in f.split(":", 1)) for f in fields]
+        # Backticks escape field names that are Move keywords.
+        yield name, [tuple(part.strip().strip("`") for part in f.split(":", 1)) for f in fields]
 
 
 def main():

@@ -62,7 +62,11 @@ fn declared(layout: &[(&str, &[(&str, &str)])]) -> Layout {
         .map(|(name, fields)| {
             let fields = fields
                 .iter()
-                .map(|(field, ty)| (field.to_string(), ty.replace(' ', "")))
+                // `r#` escapes field names that are Rust keywords.
+                .map(|(field, ty)| {
+                    let field = field.strip_prefix("r#").unwrap_or(field);
+                    (field.to_string(), ty.replace(' ', ""))
+                })
                 .collect();
             (name.to_string(), fields)
         })

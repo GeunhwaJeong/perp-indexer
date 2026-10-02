@@ -30,7 +30,8 @@ use bigdecimal::BigDecimal;
 
 use crate::schema::{
     account_caps, accounts, candles, collateral_transfers, fills, funding_payments,
-    funding_updates, markets, oracle_prices, order_tickets, orders, positions,
+    funding_updates, markets, oracle_prices, order_tickets, orders, pnl_tick_runs, pnl_ticks,
+    positions,
 };
 
 /// The part of a market row that mirrors the clearing house object.
@@ -271,4 +272,27 @@ pub struct PositionEpisode {
     pub entry_quote: BigDecimal,
     pub realized_pnl: BigDecimal,
     pub net_funding: BigDecimal,
+}
+
+/// What an account was worth at one checkpoint.
+#[derive(Clone, Debug, PartialEq, Queryable, Selectable, Insertable)]
+#[diesel(table_name = pnl_ticks)]
+pub struct PnlTick {
+    pub account_id: i64,
+    pub bucket_ms: i64,
+    pub checkpoint: i64,
+    pub timestamp_ms: i64,
+    pub equity: BigDecimal,
+    pub net_transfers: BigDecimal,
+    pub total_pnl: BigDecimal,
+}
+
+/// An interval that ticks were taken for.
+#[derive(Clone, Debug, PartialEq, Queryable, Selectable, Insertable)]
+#[diesel(table_name = pnl_tick_runs)]
+pub struct PnlTickRun {
+    pub bucket_ms: i64,
+    pub checkpoint: i64,
+    pub timestamp_ms: i64,
+    pub accounts: i64,
 }

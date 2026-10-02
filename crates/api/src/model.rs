@@ -268,3 +268,26 @@ pub struct Orderbook {
     pub bids: Vec<PriceLevel>,
     pub asks: Vec<PriceLevel>,
 }
+
+/// What an account was worth at one time, as `/v4/pnl` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnlTick {
+    pub equity: String,
+    pub net_transfers: String,
+    pub total_pnl: String,
+    pub created_at: String,
+    pub created_at_height: String,
+}
+
+/// The same, in the older shape of `/v4/historical-pnl`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalPnlTick {
+    pub equity: String,
+    pub total_pnl: String,
+    pub net_transfers: String,
+    pub created_at: String,
+    pub block_height: String,
+    pub block_time: String,
+}

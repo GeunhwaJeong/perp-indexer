@@ -9,10 +9,15 @@
 //! `perpetuals::market` and `position::position`. Results are truncated to `ifixed` precision
 //! at the end rather than after every operation, so they can differ from the engine's in the
 //! last of 18 decimals.
+//!
+//! Both the API (what an account is worth now) and the indexer (what it was worth at each
+//! tick of its history) value accounts with these, so the two agree.
 
 use bigdecimal::{BigDecimal, One, Signed, Zero};
 
 use crate::decimal::{fixed, ratio};
+
+pub mod decimal;
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -83,6 +88,79 @@ impl Pricing {
         let premium = ratio(&self.premium_twap, &self.index_price);
         fixed(premium * BigDecimal::from(HOUR_MS) / BigDecimal::from(self.funding_period_ms))
     }
+}
+
+/// A market as the indexer's tables hold it: everything its prices and the value of a position
+/// in it follow from.
+#[derive(Clone, Debug)]
+pub struct MarketState {
+    pub settlement_enabled: bool,
+    pub settlement_base_price: Option<BigDecimal>,
+    pub margin_ratio_initial: BigDecimal,
+    pub cum_funding_rate_long: BigDecimal,
+    pub cum_funding_rate_short: BigDecimal,
+    pub funding_last_upd_ms: i64,
+    pub funding_frequency_ms: i64,
+    pub funding_period_ms: i64,
+    pub premium_twap: BigDecimal,
+    pub spread_twap: BigDecimal,
+    pub best_bid_price: Option<BigDecimal>,
+    pub best_ask_price: Option<BigDecimal>,
+    pub collateral_haircut: BigDecimal,
+    /// The base asset's oracle price and its TWAP.
+    pub oracle_price: Option<BigDecimal>,
+    pub oracle_twap_price: Option<BigDecimal>,
+    pub collateral_price: Option<BigDecimal>,
+    /// The index price the engine last reported in an event.
+    pub event_index_price: Option<BigDecimal>,
+}
+
+impl MarketState {
+    /// The market's prices as of `now_ms`, and what positions in it are valued against. `None`
+    /// while no price for the base asset has been seen: the index price from the engine's own
+    /// events will do until the oracle is.
+    pub fn price(&self, now_ms: i64) -> Option<(Pricing, Valuation)> {
+        let index_price = self
+            .oracle_price
+            .clone()
+            .or_else(|| self.event_index_price.clone())?;
+        let pricing = Pricing {
+            index_twap_price: self
+                .oracle_twap_price
+                .clone()
+                .unwrap_or_else(|| index_price.clone()),
+            index_price,
+            premium_twap: self.premium_twap.clone(),
+            spread_twap: self.spread_twap.clone(),
+            best_bid: self.best_bid_price.clone(),
+            best_ask: self.best_ask_price.clone(),
+            funding_last_upd_ms: self.funding_last_upd_ms,
+            funding_frequency_ms: self.funding_frequency_ms,
+            funding_period_ms: self.funding_period_ms,
+        };
+        // A settled market values every position at its settlement price.
+        let mark_price = match (&self.settlement_base_price, self.settlement_enabled) {
+            (Some(price), true) => price.clone(),
+            _ => pricing.mark_price(now_ms),
+        };
+        let valuation = Valuation {
+            mark_price,
+            collateral_price: self
+                .collateral_price
+                .clone()
+                .unwrap_or_else(|| BigDecimal::from(1)),
+            collateral_haircut: self.collateral_haircut.clone(),
+            cum_funding_rate_long: self.cum_funding_rate_long.clone(),
+            cum_funding_rate_short: self.cum_funding_rate_short.clone(),
+            margin_ratio_initial: self.margin_ratio_initial.clone(),
+        };
+        Some((pricing, valuation))
+    }
+}
+
+/// What `coins` raw units of a collateral with `decimals` decimals are worth at `price`.
+pub fn collateral_value(coins: &BigDecimal, decimals: u32, price: &BigDecimal) -> BigDecimal {
+    fixed(coins / decimal::pow10(decimals) * price)
 }
 
 /// The funding rate one funding update charged, per hour, as a fraction of the position's value.

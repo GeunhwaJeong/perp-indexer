@@ -119,6 +119,18 @@ pub async fn commit(batch: &Batch, conn: &mut Connection<'_>) -> anyhow::Result<
             .await?;
     }
 
+    for (account_id, net) in &batch.net_transfers {
+        let updated = diesel::update(accounts::table.find(account_id))
+            .set(accounts::net_transfers.eq(accounts::net_transfers + net))
+            .execute(conn)
+            .await?;
+        // A transfer rewrites the account object, so its row was written just above.
+        if updated == 0 {
+            warn!(account_id, %net, "Transfers of an account that has no row were not counted");
+        }
+        rows += updated;
+    }
+
     for (cap_id, cap) in &batch.account_caps {
         rows += match cap {
             CapWrite::Held(cap) => {

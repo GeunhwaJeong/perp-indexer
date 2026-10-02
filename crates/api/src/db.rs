@@ -461,19 +461,25 @@ struct Count {
     count: i64,
 }
 
+/// How many fills [`account_fills`] pages over.
 pub async fn count_account_fills(
     conn: &mut Connection<'_>,
     market_ids: &[String],
     account_id: i64,
     market: Option<&str>,
+    page: Page,
 ) -> anyhow::Result<i64> {
     let count: Count = sql_query(
         "SELECT COUNT(*) AS count FROM fills f \
-         WHERE f.account_id = $1 AND f.market = ANY($2) AND ($3::TEXT IS NULL OR f.market = $3)",
+         WHERE f.account_id = $1 AND f.market = ANY($2) AND ($3::TEXT IS NULL OR f.market = $3) \
+           AND ($4::BIGINT IS NULL OR f.checkpoint <= $4) \
+           AND ($5::BIGINT IS NULL OR f.timestamp_ms <= $5)",
     )
     .bind::<BigInt, _>(account_id)
     .bind::<Array<Text>, _>(market_ids)
     .bind::<Nullable<Text>, _>(market)
+    .bind::<Nullable<BigInt>, _>(page.before_checkpoint)
+    .bind::<Nullable<BigInt>, _>(page.before_ms)
     .get_result(conn)
     .await?;
     Ok(count.count)
@@ -858,15 +864,21 @@ pub async fn account_transfers(
     .await?)
 }
 
+/// How many transfers [`account_transfers`] pages over.
 pub async fn count_account_transfers(
     conn: &mut Connection<'_>,
     account_id: i64,
+    page: Page,
 ) -> anyhow::Result<i64> {
     let count: Count = sql_query(
         "SELECT COUNT(*) AS count FROM collateral_transfers \
-         WHERE account_id = $1 AND kind IN ('deposit', 'withdraw')",
+         WHERE account_id = $1 AND kind IN ('deposit', 'withdraw') \
+           AND ($2::BIGINT IS NULL OR checkpoint <= $2) \
+           AND ($3::BIGINT IS NULL OR timestamp_ms <= $3)",
     )
     .bind::<BigInt, _>(account_id)
+    .bind::<Nullable<BigInt>, _>(page.before_checkpoint)
+    .bind::<Nullable<BigInt>, _>(page.before_ms)
     .get_result(conn)
     .await?;
     Ok(count.count)
@@ -950,20 +962,24 @@ pub async fn account_funding_payments(
     .await?)
 }
 
+/// How many payments [`account_funding_payments`] pages over.
 pub async fn count_account_funding_payments(
     conn: &mut Connection<'_>,
     market_ids: &[String],
     account_id: i64,
     market: Option<&str>,
+    after_ms: Option<i64>,
 ) -> anyhow::Result<i64> {
     let count: Count = sql_query(
         "SELECT COUNT(*) AS count FROM funding_payments p \
          WHERE p.account_id = $1 AND p.market = ANY($2) AND p.collateral_change_usd <> 0 \
-           AND ($3::TEXT IS NULL OR p.market = $3)",
+           AND ($3::TEXT IS NULL OR p.market = $3) \
+           AND ($4::BIGINT IS NULL OR p.timestamp_ms >= $4)",
     )
     .bind::<BigInt, _>(account_id)
     .bind::<Array<Text>, _>(market_ids)
     .bind::<Nullable<Text>, _>(market)
+    .bind::<Nullable<BigInt>, _>(after_ms)
     .get_result(conn)
     .await?;
     Ok(count.count)
@@ -1012,4 +1028,75 @@ pub async fn funding_updates(
     .bind::<BigInt, _>(limit)
     .load(conn)
     .await?)
+}
+
+/// What an account was worth at one checkpoint.
+#[derive(Clone, Debug, QueryableByName)]
+pub struct PnlTickRow {
+    /// Start of the interval the tick stands for, or of its day in a daily series.
+    #[diesel(sql_type = BigInt)]
+    pub start_ms: i64,
+    #[diesel(sql_type = BigInt)]
+    pub checkpoint: i64,
+    /// When the account was valued.
+    #[diesel(sql_type = BigInt)]
+    pub timestamp_ms: i64,
+    #[diesel(sql_type = Numeric)]
+    pub equity: BigDecimal,
+    #[diesel(sql_type = Numeric)]
+    pub net_transfers: BigDecimal,
+    #[diesel(sql_type = Numeric)]
+    pub total_pnl: BigDecimal,
+}
+
+/// Which ticks of an account's history to return.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PnlFilter {
+    /// One tick per UTC day, the day's first, rather than every tick.
+    pub daily: bool,
+    pub before_checkpoint: Option<i64>,
+    pub before_ms: Option<i64>,
+    pub after_checkpoint: Option<i64>,
+    pub after_ms: Option<i64>,
+    pub limit: i64,
+}
+
+/// An account's PnL history, newest first. Times are compared with the start of a tick's
+/// interval, which is the time a tick is reported at.
+pub async fn account_pnl_ticks(
+    conn: &mut Connection<'_>,
+    account_id: i64,
+    filter: PnlFilter,
+) -> anyhow::Result<Vec<PnlTickRow>> {
+    const FILTER: &str = "account_id = $1 \
+         AND ($2::BIGINT IS NULL OR checkpoint <= $2) \
+         AND ($3::BIGINT IS NULL OR bucket_ms <= $3) \
+         AND ($4::BIGINT IS NULL OR checkpoint >= $4) \
+         AND ($5::BIGINT IS NULL OR bucket_ms >= $5)";
+    let query = if filter.daily {
+        format!(
+            "SELECT * FROM ( \
+                 SELECT DISTINCT ON (bucket_ms / 86400000) \
+                        bucket_ms / 86400000 * 86400000 AS start_ms, checkpoint, timestamp_ms, \
+                        equity, net_transfers, total_pnl \
+                 FROM pnl_ticks WHERE {FILTER} \
+                 ORDER BY bucket_ms / 86400000, bucket_ms \
+             ) days ORDER BY start_ms DESC LIMIT $6"
+        )
+    } else {
+        format!(
+            "SELECT bucket_ms AS start_ms, checkpoint, timestamp_ms, equity, net_transfers, \
+                    total_pnl \
+             FROM pnl_ticks WHERE {FILTER} ORDER BY bucket_ms DESC LIMIT $6"
+        )
+    };
+    Ok(sql_query(query)
+        .bind::<BigInt, _>(account_id)
+        .bind::<Nullable<BigInt>, _>(filter.before_checkpoint)
+        .bind::<Nullable<BigInt>, _>(filter.before_ms)
+        .bind::<Nullable<BigInt>, _>(filter.after_checkpoint)
+        .bind::<Nullable<BigInt>, _>(filter.after_ms)
+        .bind::<BigInt, _>(filter.limit)
+        .load(conn)
+        .await?)
 }

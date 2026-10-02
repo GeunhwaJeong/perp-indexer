@@ -19,18 +19,26 @@ funding, collateral transfers, stop/TWAP order tickets and each position's runni
 built from events. Every batch of checkpoints is written in one transaction together with the
 pipeline's watermark, so it is applied exactly once.
 
+The same transaction keeps the **PnL history**. Once per interval (an hour by default), every
+account that holds anything is valued: its unallocated balance plus the margin of each of its
+positions at the mark price. A tick is the account's value at one exact checkpoint, with what was
+transferred into it so far, and the difference between the two, which is what trading, funding
+and fees have made or lost. A batch that spans several intervals, as while backfilling, takes
+ticks for the last one only: the state in between is no longer there to value.
+
 The **API** (`perp-api`) serves those tables over REST and a WebSocket, in the protocol of the
 dYdX v4 indexer, which is what the trading front end is written against. It is a separate
 process that only reads the database.
 
-Still to come: decoders for the market-making vault, and the hardening pass (continuous
-reconciliation, replay in CI, load tests).
+Still to come: decoders for the market-making vault, and the rest of the hardening pass
+(continuous reconciliation, replay in CI, load tests).
 
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `crates/types` | Typed decoders for the engine's events and state objects. No chain dependencies. |
+| `crates/engine` | The engine's pricing and margin formulas, restated over decimals. The indexer and the API value accounts with the same code. |
 | `crates/schema` | Postgres schema and migrations. |
 | `crates/indexer` | The indexer binary, built on `haneul-indexer-alt-framework`. |
 | `crates/api` | The API binary: REST and WebSocket over the indexer's tables. |
@@ -69,6 +77,9 @@ Events of `perpetuals`, `perpetuals_orders` and `oracle_aggregator` are decoded.
 any other name is recorded as raw bytes, which keeps its history in the ledger until decoders for
 it are written.
 
+`--pnl-tick-interval-ms` (default one hour) is how often accounts are valued for their PnL
+history.
+
 Metrics are served on `--metrics-address` (default `0.0.0.0:9184`).
 `perp_indexer_undecoded_events_total` should stay at zero: anything else means the decoders lag
 the deployed package.
@@ -100,13 +111,26 @@ message IDs that have no gaps. Books, markets and the tape are answered from mem
 accounts from the database.
 
 Each WebSocket connection is a file descriptor: raise the process's limit (`ulimit -n`) well
-above `--ws-max-connections`, and terminate TLS and limit connections per address in the proxy
-in front. An idle connection holds a few tens of kilobytes.
+above `--ws-max-connections`, and terminate TLS and limit connections and requests per address
+in the proxy in front. An idle connection holds a few tens of kilobytes.
 
 Nothing queues without bound. A client that does not keep up with the rounds, stops reading, or
-sends more than `--ws-message-rate` messages a second is disconnected and starts over. When the
-feed itself falls more than `--max-round-checkpoints` behind (an indexer backfill, an outage),
-it reloads and makes every client start over rather than replay the gap.
+sends more than `--ws-message-rate` messages a second is disconnected and starts over. A peer
+that has gone without closing, which looks merely idle, is found by its silence: every
+`--ws-ping-interval-secs` it is sent a ping, and it is dropped when one goes unanswered for
+`--ws-pong-timeout-secs`. When the feed itself falls more than `--max-round-checkpoints` behind
+(an indexer backfill, an outage), it reloads and makes every client start over rather than
+replay the gap.
+
+Over REST, skipping rows costs the database as much as returning them, so a paged request may
+skip at most `--max-pagination-offset` rows (25,000 by default) and is refused past that; a
+client narrows the time range instead. Successful responses say how long they may be reused
+(`Cache-Control`: a second for live data, ten for history that grows by the hour, never for the
+clock), so that a cache in front absorbs bursts of identical requests.
+
+`perp_api_book_crossed` is 1 while a book's best bid is at or above its best ask. The engine
+would have matched those orders, so if it stays set the book has drifted from the chain's.
+`perp_api_book_levels` is the depth of each side.
 
 ### How the engine's model maps to the protocol
 
@@ -122,7 +146,7 @@ end's own arithmetic stays true.
   position value at the mark price is the engine's margin.
 - **Prices.** `oraclePrice` is the engine's mark price, which is what positions are valued and
   liquidated at. It, accrued funding and the value of collateral are the only numbers computed
-  here rather than copied; `crates/api/src/engine.rs` restates the engine's formulas for them.
+  here rather than copied; `crates/engine` restates the engine's formulas for them.
 - **Amounts.** Balances are in USD at the collateral's oracle price. Deposits and withdrawals are
   in coins. The quote asset is presented as `USDC`, the symbol the front end knows.
 - **Orders.** Only orders that rest on the book are indexed, as `LIMIT` orders whose `id` is the
@@ -133,8 +157,12 @@ end's own arithmetic stays true.
   the taker's side.
 - **Funding.** Rates are per hour, as fractions of position value. A settlement that moved
   nothing is not listed as a payment.
-- **Not kept.** Historical PnL and trading rewards answer empty. `startingOpenInterest` of a
-  candle is `0`.
+- **PnL history.** `/v4/pnl` serves the ticks the indexer takes, each reported at the start of
+  its interval; with `daily=true`, the first tick of each UTC day. Equity is the account's
+  equity as the subaccount endpoint reports it, over every market on chain. Net transfers are
+  the coins deposited less the coins withdrawn, at the collateral's price when the tick was
+  taken. `/v4/historical-pnl` serves the same ticks in the older shape.
+- **Not kept.** Trading rewards answer empty. `startingOpenInterest` of a candle is `0`.
 
 ## Keeping the decoders honest
 
@@ -162,15 +190,17 @@ scripts/reconcile_ledger.py \
 `scripts/check_state.py` does the same for the state tables. Positions, markets and accounts are
 compared with the node's rendering of their objects, and the tables built from events are
 compared with them: open orders against a position's resting quantities and pending order count,
-fills against its size, transfers against an account's balance, the top of the book and the open
-interest against the market, candles against trades.
+fills against its size, transfers against an account's balance and its running net transfers,
+the top of the book and the open interest against the market, candles against trades, and the
+PnL ticks against the runs that took them.
 
 `scripts/check_api.mjs` checks the API. It follows every channel the way a client does and
 checks the protocol (message IDs, acknowledgements, the error texts clients match on), that a
 client which followed every update holds the same state as one that subscribes afterwards and as
 REST reports, that every object has the fields the front end requires, that responses equal what
-the tables hold, and, given the engine's own view from the scenario below, that the mark price,
-balances and accrued funding equal the engine's:
+the tables hold (the PnL history included, whose latest tick must equal the account's equity),
+and, given the engine's own view from the scenario below, that the mark price, balances and
+accrued funding equal the engine's:
 
 ```sh
 scripts/check_api.mjs --api http://127.0.0.1:3002 --deployment perp.localnet.json \
@@ -193,9 +223,10 @@ scripts/localnet/run_all.sh <work dir> <engine checkout copy> <haneul binary> po
 ```
 
 With `HOLD=<path>` the stack stays up after the checks until that file appears. That is the
-state `scripts/localnet/faults.mjs` needs: it floods the API, stalls a reader, freezes the
-process until its feed falls behind and drops its database connections, and checks that each
-ends the way it should.
+state `scripts/localnet/faults.mjs` needs: it floods the API, leaves its pings unanswered,
+stalls a reader, freezes the process until its feed falls behind and drops its database
+connections, and checks that each ends the way it should. The pass takes PnL ticks every five
+seconds (`PNL_TICK_INTERVAL_MS`) so that the history has something in it.
 
 ```sh
 scripts/localnet/faults.mjs --api-binary target/debug/perp-api \

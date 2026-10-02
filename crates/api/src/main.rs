@@ -68,6 +68,9 @@ struct Args {
     ws_send_timeout_secs: u64,
     #[clap(long, default_value_t = 30)]
     ws_ping_interval_secs: u64,
+    /// Seconds a WebSocket ping may go unanswered before the client is considered gone.
+    #[clap(long, default_value_t = 10)]
+    ws_pong_timeout_secs: u64,
     /// Messages a WebSocket client may send per second.
     #[clap(long, default_value_t = 20.0)]
     ws_message_rate: f64,
@@ -80,6 +83,9 @@ struct Args {
     /// `/health` fails when the indexed chain time is older than this many seconds.
     #[clap(long, default_value_t = 60)]
     max_lag_secs: u64,
+    /// The most rows a paged request may skip (`(page - 1) * limit`).
+    #[clap(long, default_value_t = 25_000)]
+    max_pagination_offset: i64,
 }
 
 #[tokio::main]
@@ -119,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
             book_depth: args.book_depth,
             send_timeout: Duration::from_secs(args.ws_send_timeout_secs),
             ping_interval: Duration::from_secs(args.ws_ping_interval_secs),
+            pong_timeout: Duration::from_secs(args.ws_pong_timeout_secs),
             max_buffered_rounds: args.ws_backlog,
             message_rate: args.ws_message_rate,
             message_burst: args.ws_message_burst,
@@ -132,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
         ws,
         book_depth: args.book_depth,
         max_lag: Duration::from_secs(args.max_lag_secs),
+        max_pagination_offset: args.max_pagination_offset,
     });
 
     let feed = Feed::new(

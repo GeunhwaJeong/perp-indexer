@@ -25,6 +25,11 @@ pub struct ApiMetrics {
     pub feed_resets: IntCounter,
     pub feed_errors: IntCounter,
     pub feed_round_seconds: Histogram,
+    /// Price levels resting on each side of each book.
+    pub book_levels: IntGaugeVec,
+    /// 1 while a book's best bid is at or above its best ask. The engine would have matched
+    /// those orders, so anything but a passing blip means the book has drifted from the chain's.
+    pub book_crossed: IntGaugeVec,
     pub ws_connections: IntGauge,
     pub ws_subscriptions: IntGaugeVec,
     pub ws_messages_sent: IntCounterVec,
@@ -72,6 +77,20 @@ impl ApiMetrics {
                 "feed_round_seconds",
                 "Time to build one feed round",
                 LATENCY_BUCKETS.to_vec(),
+                registry,
+            )
+            .unwrap(),
+            book_levels: register_int_gauge_vec_with_registry!(
+                "book_levels",
+                "Price levels resting in a book, by ticker and side",
+                &["ticker", "side"],
+                registry,
+            )
+            .unwrap(),
+            book_crossed: register_int_gauge_vec_with_registry!(
+                "book_crossed",
+                "Whether a book's best bid is at or above its best ask, by ticker",
+                &["ticker"],
                 registry,
             )
             .unwrap(),

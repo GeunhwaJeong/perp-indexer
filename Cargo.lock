@@ -4747,6 +4747,7 @@ dependencies = [
  "haneul-indexer-alt-metrics",
  "haneul-pg-db",
  "num-bigint 0.4.6",
+ "perp-engine",
  "prometheus",
  "serde",
  "serde_json",
@@ -4757,6 +4758,14 @@ dependencies = [
  "tower-http",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "perp-engine"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "num-bigint 0.4.6",
 ]
 
 [[package]]
@@ -4776,6 +4785,7 @@ dependencies = [
  "haneul-types",
  "move-core-types",
  "num-bigint 0.4.6",
+ "perp-engine",
  "perp-schema",
  "perp-types",
  "prometheus",

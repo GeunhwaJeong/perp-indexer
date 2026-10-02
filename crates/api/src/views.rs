@@ -17,13 +17,16 @@ use bigdecimal::{BigDecimal, Signed, ToPrimitive, Zero};
 
 use crate::db::{
     AccountRow, CandleRow, FillRow, FundingPaymentRow, FundingUpdateRow, MarketRow, MarketStatsRow,
-    OrderRow, PositionRow, TransferRow,
+    OrderRow, PnlTickRow, PositionRow, TransferRow,
 };
 use crate::decimal::{plain, pow10, ratio};
-use crate::engine::{self, Margin, Pricing, Valuation, settled_funding_rate_1h};
+use crate::engine::{
+    self, Margin, MarketState, Pricing, Valuation, collateral_value, settled_funding_rate_1h,
+};
 use crate::model::{
-    AssetPosition, Candle, Fill, FundingPayment, HistoricalFunding, Order, ParentSubaccount,
-    PerpetualMarket, PerpetualPosition, Subaccount, Trade, TradeHistory, Transfer, TransferParty,
+    AssetPosition, Candle, Fill, FundingPayment, HistoricalFunding, HistoricalPnlTick, Order,
+    ParentSubaccount, PerpetualMarket, PerpetualPosition, PnlTick, Subaccount, Trade, TradeHistory,
+    Transfer, TransferParty,
 };
 use crate::time::iso;
 
@@ -88,40 +91,26 @@ impl MarketView {
     /// base asset has been seen.
     pub fn new(row: MarketRow, ticker: &str, now_ms: i64) -> Option<Self> {
         let index = row.market_index?;
-        let index_price = row
-            .oracle_price
-            .clone()
-            .or_else(|| row.event_index_price.clone())?;
-        let pricing = Pricing {
-            index_twap_price: row
-                .oracle_twap_price
-                .clone()
-                .unwrap_or_else(|| index_price.clone()),
-            index_price,
-            premium_twap: row.premium_twap.clone(),
-            spread_twap: row.spread_twap.clone(),
-            best_bid: row.best_bid_price.clone(),
-            best_ask: row.best_ask_price.clone(),
+        let state = MarketState {
+            settlement_enabled: row.settlement_enabled,
+            settlement_base_price: row.settlement_base_price.clone(),
+            margin_ratio_initial: row.margin_ratio_initial.clone(),
+            cum_funding_rate_long: row.cum_funding_rate_long.clone(),
+            cum_funding_rate_short: row.cum_funding_rate_short.clone(),
             funding_last_upd_ms: row.funding_last_upd_ms,
             funding_frequency_ms: row.funding_frequency_ms,
             funding_period_ms: row.funding_period_ms,
-        };
-        // A settled market values every position at its settlement price.
-        let mark_price = match (&row.settlement_base_price, row.settlement_enabled) {
-            (Some(price), true) => price.clone(),
-            _ => pricing.mark_price(now_ms),
-        };
-        let valuation = Valuation {
-            mark_price,
-            collateral_price: row
-                .collateral_price
-                .clone()
-                .unwrap_or_else(|| BigDecimal::from(1)),
+            premium_twap: row.premium_twap.clone(),
+            spread_twap: row.spread_twap.clone(),
+            best_bid_price: row.best_bid_price.clone(),
+            best_ask_price: row.best_ask_price.clone(),
             collateral_haircut: row.collateral_haircut.clone(),
-            cum_funding_rate_long: row.cum_funding_rate_long.clone(),
-            cum_funding_rate_short: row.cum_funding_rate_short.clone(),
-            margin_ratio_initial: row.margin_ratio_initial.clone(),
+            oracle_price: row.oracle_price.clone(),
+            oracle_twap_price: row.oracle_twap_price.clone(),
+            collateral_price: row.collateral_price.clone(),
+            event_index_price: row.event_index_price.clone(),
         };
+        let (pricing, valuation) = state.price(now_ms)?;
         Some(Self {
             ticker: ticker.to_owned(),
             index,
@@ -489,6 +478,28 @@ pub fn historical_funding_object(
     }
 }
 
+/// A tick of an account's PnL history, reported at the start of its interval.
+pub fn pnl_tick_object(row: &PnlTickRow) -> PnlTick {
+    PnlTick {
+        equity: plain(&row.equity),
+        net_transfers: plain(&row.net_transfers),
+        total_pnl: plain(&row.total_pnl),
+        created_at: iso(row.start_ms),
+        created_at_height: height(row.checkpoint),
+    }
+}
+
+pub fn historical_pnl_tick_object(row: &PnlTickRow) -> HistoricalPnlTick {
+    HistoricalPnlTick {
+        equity: plain(&row.equity),
+        total_pnl: plain(&row.total_pnl),
+        net_transfers: plain(&row.net_transfers),
+        created_at: iso(row.start_ms),
+        block_height: height(row.checkpoint),
+        block_time: iso(row.timestamp_ms),
+    }
+}
+
 fn quote_position(balance: &BigDecimal, subaccount_number: i64) -> AssetPosition {
     AssetPosition {
         symbol: QUOTE_SYMBOL,
@@ -611,7 +622,7 @@ pub fn account_balance(
     collateral_decimals: u32,
     collateral_price: &BigDecimal,
 ) -> BigDecimal {
-    (&account.collateral / pow10(collateral_decimals) * collateral_price).with_scale(18)
+    collateral_value(&account.collateral, collateral_decimals, collateral_price)
 }
 
 /// The quote position of the parent subaccount: the account's unallocated balance.
@@ -1116,6 +1127,34 @@ mod tests {
         assert_eq!(withdrawal.transfer_type, "WITHDRAWAL");
         assert_eq!(withdrawal.sender.subaccount_number, Some(2));
         assert_eq!(withdrawal.id, None);
+    }
+
+    #[test]
+    fn pnl_ticks_are_reported_at_the_start_of_their_interval() {
+        let row = PnlTickRow {
+            start_ms: 3_600_000,
+            checkpoint: 42,
+            timestamp_ms: 3_600_250,
+            equity: dec("1130.000000000000000000"),
+            net_transfers: dec("1000.00"),
+            total_pnl: dec("130.000"),
+        };
+        let tick = pnl_tick_object(&row);
+        assert_eq!(
+            (
+                tick.equity.as_str(),
+                tick.net_transfers.as_str(),
+                tick.total_pnl.as_str()
+            ),
+            ("1130", "1000", "130")
+        );
+        assert_eq!(tick.created_at, "1970-01-01T01:00:00.000Z");
+        assert_eq!(tick.created_at_height, "42");
+
+        let old = historical_pnl_tick_object(&row);
+        assert_eq!(old.block_height, "42");
+        assert_eq!(old.block_time, "1970-01-01T01:00:00.250Z");
+        assert_eq!(old.created_at, tick.created_at);
     }
 
     #[test]

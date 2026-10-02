@@ -90,6 +90,8 @@ pub struct Batch {
     pub funding_updates: Vec<FundingUpdate>,
     pub funding_payments: Vec<FundingPayment>,
     pub collateral_transfers: Vec<CollateralTransfer>,
+    /// Coins each account was sent less coins it paid out, over the batch.
+    pub net_transfers: BTreeMap<i64, BigDecimal>,
     /// `None` for a feed that was removed.
     pub oracle_prices: BTreeMap<(i64, i32), Option<OraclePrice>>,
     pub tickets: Vec<TicketChange>,
@@ -217,7 +219,16 @@ impl Batch {
                     .push(PositionEvent::Funding(self.funding_payments.len()));
                 self.funding_payments.push(payment);
             }
-            Change::CollateralTransfer(transfer) => self.collateral_transfers.push(transfer),
+            Change::CollateralTransfer(transfer) => {
+                // Moves between an account and its markets stay inside the account.
+                let net = self.net_transfers.entry(transfer.account_id).or_default();
+                match transfer.kind.as_str() {
+                    "deposit" => *net += &transfer.amount,
+                    "withdraw" => *net -= &transfer.amount,
+                    _ => {}
+                }
+                self.collateral_transfers.push(transfer);
+            }
             Change::OraclePrice(price) => {
                 self.oracle_prices
                     .insert((price.storage_id, price.source_id), Some(price));
@@ -457,6 +468,33 @@ mod tests {
         batch.push(Change::Fill(fill));
         assert_eq!(batch.fills.len(), 2);
         assert!(batch.candles.is_empty());
+    }
+
+    #[test]
+    fn deposits_and_withdrawals_net_per_account() {
+        let transfer = |account_id, kind: &str, amount: &str| {
+            Change::CollateralTransfer(CollateralTransfer {
+                checkpoint: 1,
+                tx_index: 0,
+                event_index: 0,
+                tx_digest: "tx".to_owned(),
+                timestamp_ms: 1_000,
+                account_id,
+                kind: kind.to_owned(),
+                market: None,
+                amount: dec(amount),
+            })
+        };
+        let mut batch = Batch::default();
+        batch.push(transfer(1, "deposit", "100"));
+        batch.push(transfer(1, "allocate", "60"));
+        batch.push(transfer(1, "withdraw", "30"));
+        batch.push(transfer(1, "settlement", "5"));
+        batch.push(transfer(2, "withdraw", "7"));
+
+        assert_eq!(batch.collateral_transfers.len(), 5);
+        assert_eq!(batch.net_transfers[&1], dec("70"));
+        assert_eq!(batch.net_transfers[&2], dec("-7"));
     }
 
     #[test]

@@ -69,6 +69,7 @@ dropdb --if-exists "$DB_NAME"
 createdb "$DB_NAME"
 PERP_PACKAGES="$PACKAGES" "$INDEXER" --database-url "$DATABASE_URL" \
     --rpc-api-url "http://$GRPC" --streaming-url "http://$GRPC" \
+    --pnl-tick-interval-ms "${PNL_TICK_INTERVAL_MS:-5000}" \
     --metrics-address 127.0.0.1:9184 > "$WORK/indexer.log" 2>&1 &
 sleep 8
 

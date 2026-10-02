@@ -55,6 +55,22 @@ impl Book {
         }
     }
 
+    /// The highest bid and the lowest ask.
+    pub fn best(&self) -> (Option<&BigDecimal>, Option<&BigDecimal>) {
+        (self.bids.keys().next_back(), self.asks.keys().next())
+    }
+
+    /// Whether the best bid is at or above the best ask. The engine matches such orders, so a
+    /// book that stays crossed has drifted from the chain's.
+    pub fn is_crossed(&self) -> bool {
+        matches!(self.best(), (Some(bid), Some(ask)) if bid >= ask)
+    }
+
+    /// Price levels on the bid and ask side.
+    pub fn levels(&self) -> (usize, usize) {
+        (self.bids.len(), self.asks.len())
+    }
+
     /// The best `depth` levels of each side, best first.
     pub fn snapshot(&self, depth: usize) -> Orderbook {
         let level = |(price, size): (&BigDecimal, &BigDecimal)| PriceLevel {
@@ -180,8 +196,23 @@ impl Hub {
         self.public().map(|p| (p.checkpoint, p.timestamp_ms))
     }
 
+    /// Reports the shape of every book: how deep each side is, and whether it is crossed.
+    fn observe_books(&self, state: &PublicState) {
+        for (ticker, book) in &state.books {
+            let (bids, asks) = book.levels();
+            let levels = &self.metrics.book_levels;
+            levels.with_label_values(&[ticker, "bid"]).set(bids as i64);
+            levels.with_label_values(&[ticker, "ask"]).set(asks as i64);
+            self.metrics
+                .book_crossed
+                .with_label_values(&[ticker])
+                .set(i64::from(book.is_crossed()));
+        }
+    }
+
     /// Replaces the public state and makes every connection start over.
     pub fn reset(&self, state: PublicState) {
+        self.observe_books(&state);
         *self.public.write().unwrap() = Some(state);
         // No receivers is not an error: nobody is connected.
         let _ = self.events.send(Event::Reset);
@@ -211,6 +242,7 @@ impl Hub {
                 trades.push_front(trade);
                 trades.truncate(RECENT_TRADES);
             }
+            self.observe_books(state);
         }
         let _ = self.events.send(Event::Round(Arc::new(round)));
     }
@@ -291,6 +323,52 @@ mod tests {
         assert_eq!(levels(&snapshot.bids), ["1@99"]);
         assert_eq!(levels(&snapshot.asks), ["4@100.5", "5@101"]);
         assert_eq!(book.snapshot(1).asks.len(), 1);
+        assert_eq!(book.levels(), (1, 2));
+        assert_eq!(book.best(), (Some(&dec("99")), Some(&dec("100.5"))));
+    }
+
+    #[test]
+    fn a_book_whose_best_bid_reaches_its_best_ask_is_crossed() {
+        let mut book = Book::default();
+        assert!(!book.is_crossed());
+        book.set(false, dec("99"), dec("1"));
+        assert!(!book.is_crossed(), "one side is not a cross");
+        book.set(true, dec("100"), dec("1"));
+        assert!(!book.is_crossed());
+        book.set(false, dec("100.0"), dec("1"));
+        assert!(book.is_crossed());
+        book.set(false, dec("100"), dec("0"));
+        assert!(!book.is_crossed());
+    }
+
+    #[test]
+    fn the_shape_of_every_book_is_reported() {
+        let hub = Hub::new(ApiMetrics::new(&Registry::new()), 8);
+        let mut state = PublicState::default();
+        let book = state.books.entry("BTC-USD".to_owned()).or_default();
+        book.set(false, dec("99"), dec("1"));
+        book.set(true, dec("101"), dec("1"));
+        book.set(true, dec("102"), dec("1"));
+        hub.reset(state);
+        let levels = |side| {
+            let gauge = &hub.metrics.book_levels;
+            gauge.with_label_values(&["BTC-USD", side]).get()
+        };
+        let crossed = || {
+            hub.metrics
+                .book_crossed
+                .with_label_values(&["BTC-USD"])
+                .get()
+        };
+        assert_eq!((levels("bid"), levels("ask"), crossed()), (1, 2, 0));
+
+        let update = PublicUpdate {
+            markets: None,
+            levels: vec![("BTC-USD".to_owned(), false, dec("101"), dec("2"))],
+            trades: vec![],
+        };
+        hub.publish(Round::default(), update);
+        assert_eq!((levels("bid"), crossed()), (2, 1));
     }
 
     #[test]

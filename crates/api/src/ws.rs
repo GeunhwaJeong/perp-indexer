@@ -10,7 +10,8 @@
 //!
 //! One task owns each connection. It never queues without bound: rounds arrive over a bounded
 //! broadcast channel, and a client that cannot keep up is disconnected and starts over, as is
-//! one that stops reading.
+//! one that stops reading. A peer that has gone without closing is found by the pings it leaves
+//! unanswered.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,6 +59,8 @@ pub struct WsConfig {
     /// How long a write may take before the client is considered gone.
     pub send_timeout: Duration,
     pub ping_interval: Duration,
+    /// How long a ping may go unanswered before the peer is considered gone.
+    pub pong_timeout: Duration,
     /// Rounds held for a subscription whose initial data is still loading.
     pub max_buffered_rounds: usize,
     /// Messages a client may send per second, and how many it may send at once after a pause.
@@ -193,6 +196,8 @@ enum Close {
     AccountMoved,
     /// The client sent more messages than it is allowed.
     RateLimited,
+    /// The peer left a ping unanswered.
+    Unresponsive,
     Shutdown,
 }
 
@@ -204,6 +209,7 @@ impl Close {
             Close::Reset => "reset",
             Close::AccountMoved => "account_moved",
             Close::RateLimited => "rate_limited",
+            Close::Unresponsive => "unresponsive",
             Close::Shutdown => "shutdown",
         }
     }
@@ -240,6 +246,40 @@ impl Budget {
     }
 }
 
+/// Tells a peer that has gone from one that is merely quiet.
+///
+/// A connection whose peer vanished without closing (a dropped network, a suspended laptop)
+/// looks idle, and a write to it succeeds for as long as the kernel has room to buffer it. Only
+/// a ping left unanswered shows that nobody is there.
+struct Heartbeat {
+    timeout: Duration,
+    /// When the oldest ping still unanswered was sent.
+    awaiting_since: Option<Instant>,
+}
+
+impl Heartbeat {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            awaiting_since: None,
+        }
+    }
+
+    fn ping_sent(&mut self, now: Instant) {
+        self.awaiting_since.get_or_insert(now);
+    }
+
+    /// Any pong will do: it shows the peer is reading and writing.
+    fn pong_received(&mut self) {
+        self.awaiting_since = None;
+    }
+
+    /// When the peer is given up on, if a ping is outstanding.
+    fn deadline(&self) -> Option<Instant> {
+        self.awaiting_since.map(|sent| sent + self.timeout)
+    }
+}
+
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
 struct Connection {
@@ -251,6 +291,7 @@ struct Connection {
     generation: u64,
     loads: mpsc::Sender<LoadResult>,
     budget: Budget,
+    heartbeat: Heartbeat,
 }
 
 pub async fn serve(socket: WebSocket, ctx: Arc<WsContext>) {
@@ -271,6 +312,7 @@ pub async fn serve(socket: WebSocket, ctx: Arc<WsContext>) {
         generation: 0,
         loads,
         budget: Budget::new(ctx.config.message_rate, ctx.config.message_burst),
+        heartbeat: Heartbeat::new(ctx.config.pong_timeout),
     };
 
     ctx.hub.metrics.ws_connections.inc();
@@ -296,7 +338,7 @@ pub async fn serve(socket: WebSocket, ctx: Arc<WsContext>) {
     );
 
     let frame = match close {
-        Close::Gone => return,
+        Close::Gone | Close::Unresponsive => return,
         Close::Shutdown => (close_code::AWAY, "server shutting down"),
         Close::Lagged => (close_code::POLICY, "client too slow"),
         Close::RateLimited => (close_code::POLICY, "too many messages"),
@@ -336,10 +378,18 @@ impl Connection {
         ping.tick().await;
 
         loop {
+            let unanswered = self.heartbeat.deadline();
             let step = tokio::select! {
+                // In order, so that a pong already received is seen before the deadline it
+                // answers: after the process itself was stalled, both are ready at once.
+                biased;
                 _ = ctx.cancel.cancelled() => Err(Close::Shutdown),
                 message = self.socket.recv() => match message {
                     Some(Ok(Message::Text(text))) => self.on_client_message(&text).await,
+                    Some(Ok(Message::Pong(_))) => {
+                        self.heartbeat.pong_received();
+                        Ok(())
+                    }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => Err(Close::Gone),
                     // Pings are answered by the socket itself; binary frames mean nothing here.
                     Some(Ok(_)) => Ok(()),
@@ -351,7 +401,11 @@ impl Connection {
                     Err(broadcast::error::RecvError::Closed) => Err(Close::Shutdown),
                 },
                 Some(result) = loaded.recv() => self.on_loaded(result).await,
-                _ = ping.tick() => self.write(Message::Ping(Default::default())).await,
+                _ = ping.tick() => {
+                    self.heartbeat.ping_sent(Instant::now());
+                    self.write(Message::Ping(Default::default())).await
+                }
+                _ = sleep_until(unanswered), if unanswered.is_some() => Err(Close::Unresponsive),
             };
             if let Err(close) = step {
                 return close;
@@ -995,6 +1049,14 @@ impl Connection {
     }
 }
 
+/// Sleeps until `deadline`, or forever when there is none.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Moves the subaccount numbers in a list of objects from parent subaccount 0 to `parent`.
 fn shifted(mut items: Value, parent: i64) -> Value {
     if parent != 0 {
@@ -1076,6 +1138,25 @@ mod tests {
         let later = start + Duration::from_secs(60);
         assert!((0..3).all(|_| budget.take(later)));
         assert!(!budget.take(later));
+    }
+
+    #[test]
+    fn a_peer_is_given_up_on_when_a_ping_goes_unanswered() {
+        let start = Instant::now();
+        let mut heartbeat = Heartbeat::new(Duration::from_secs(10));
+        assert_eq!(heartbeat.deadline(), None);
+
+        heartbeat.ping_sent(start);
+        assert_eq!(heartbeat.deadline(), Some(start + Duration::from_secs(10)));
+        // A second ping does not push back the deadline of the first.
+        heartbeat.ping_sent(start + Duration::from_secs(5));
+        assert_eq!(heartbeat.deadline(), Some(start + Duration::from_secs(10)));
+
+        heartbeat.pong_received();
+        assert_eq!(heartbeat.deadline(), None);
+        let later = start + Duration::from_secs(30);
+        heartbeat.ping_sent(later);
+        assert_eq!(heartbeat.deadline(), Some(later + Duration::from_secs(10)));
     }
 
     #[test]

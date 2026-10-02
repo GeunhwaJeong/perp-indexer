@@ -29,6 +29,8 @@ haneul-indexer-alt-metrics.workspace = true
 haneul-pg-db.workspace = true
 telemetry-subscribers.workspace = true
 
+perp-engine.workspace = true
+
 [[bin]]
 name = "perp-api"
 path = "src/main.rs"

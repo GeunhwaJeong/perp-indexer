@@ -184,6 +184,39 @@ def check_invariants(args, c):
     """):
         c.eq(f"account {row['account_id']} collateral = net transfers", Decimal(row["collateral"]), Decimal(row["net"]))
 
+    # The running total of what came into an account from outside, and the PnL history kept
+    # with it.
+    for row in rows(args, """
+        SELECT a.account_id, a.net_transfers,
+               coalesce(sum(CASE t.kind WHEN 'deposit' THEN t.amount WHEN 'withdraw' THEN -t.amount END), 0) AS net
+        FROM accounts a
+        LEFT JOIN collateral_transfers t ON t.account_id = a.account_id
+        GROUP BY a.account_id, a.net_transfers
+    """):
+        c.eq(f"account {row['account_id']} net_transfers = deposits - withdrawals",
+             Decimal(row["net_transfers"]), Decimal(row["net"]))
+    bad = rows(args, "SELECT account_id, bucket_ms FROM pnl_ticks WHERE total_pnl <> equity - net_transfers OR equity < 0")
+    c.eq("pnl ticks whose pnl is not equity - net transfers", len(bad), 0)
+    bad = rows(args, """
+        SELECT r.bucket_ms FROM pnl_tick_runs r
+        LEFT JOIN pnl_ticks t ON t.bucket_ms = r.bucket_ms
+        GROUP BY r.bucket_ms, r.accounts, r.checkpoint, r.timestamp_ms
+        HAVING count(t.account_id) <> r.accounts
+            OR bool_or(t.checkpoint <> r.checkpoint OR t.timestamp_ms <> r.timestamp_ms)
+            OR r.timestamp_ms < r.bucket_ms
+    """)
+    c.eq("pnl tick runs that do not match their ticks", len(bad), 0)
+    bad = rows(args, """
+        SELECT a.account_id FROM accounts a
+        WHERE (a.collateral <> 0 OR EXISTS (SELECT 1 FROM positions p WHERE p.account_id = a.account_id
+                                              AND (p.collateral <> 0 OR p.base <> 0)))
+          AND EXISTS (SELECT 1 FROM pnl_tick_runs)
+          AND NOT EXISTS (SELECT 1 FROM pnl_ticks t WHERE t.account_id = a.account_id
+                            AND t.bucket_ms = (SELECT max(bucket_ms) FROM pnl_tick_runs))
+          AND a.updated_checkpoint <= (SELECT max(checkpoint) FROM pnl_tick_runs)
+    """)
+    c.eq("funded accounts missing from the latest pnl ticks", len(bad), 0)
+
     # Orders and candles are consistent with themselves and with the fills.
     bad = rows(args, """
         SELECT market, order_id FROM orders

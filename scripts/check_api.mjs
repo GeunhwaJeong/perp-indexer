@@ -482,6 +482,21 @@ const SHAPES = {
     effectiveAt: iso,
     effectiveAtHeight: int,
   },
+  pnlTick: {
+    equity: dec,
+    netTransfers: dec,
+    totalPnl: dec,
+    createdAt: iso,
+    createdAtHeight: int,
+  },
+  historicalPnlTick: {
+    equity: dec,
+    totalPnl: dec,
+    netTransfers: dec,
+    createdAt: iso,
+    blockHeight: int,
+    blockTime: iso,
+  },
   tradeHistory: {
     id: str,
     marketId: str,
@@ -701,6 +716,11 @@ async function checkPublicRest(late, probe) {
     [`/v4/fills/parentSubaccountNumber?address=${OWNER}&parentSubaccountNumber=128`, 400, 'parentSubaccountNumber must be'],
     [`/v4/transfers/parentSubaccountNumber?address=0x${'9'.repeat(64)}&parentSubaccountNumber=0`, 404, 'No subaccount found with address'],
     [`/v4/addresses/0x${'9'.repeat(64)}/parentSubaccountNumber/0`, 404, 'No subaccount found with address'],
+    [`/v4/pnl/parentSubaccountNumber?address=0x${'9'.repeat(64)}&parentSubaccountNumber=0`, 404, 'No subaccount found with address'],
+    [`/v4/pnl/parentSubaccountNumber?address=${OWNER}&parentSubaccountNumber=0&daily=maybe`, 400, 'daily must be'],
+    // Skipping rows costs the database as much as returning them: a request may not page deep.
+    [`/v4/trades/perpetualMarket/${TICKERS[0]}?limit=1000&page=27`, 400, 'exceeds the maximum'],
+    [`/v4/fills/parentSubaccountNumber?address=${OWNER}&parentSubaccountNumber=0&limit=100&page=252`, 400, 'exceeds the maximum'],
   ]) {
     const body = await rest(path, status);
     check(`rest: ${path.slice(0, 60)} answers ${status} in the API's error shape`, body.errors?.[0]?.msg?.includes(text), JSON.stringify(body));
@@ -708,7 +728,19 @@ async function checkPublicRest(late, probe) {
   const nobody = `address=0x${'9'.repeat(64)}&parentSubaccountNumber=0`;
   same('rest: an address without an account has no fills', await rest(`/v4/fills/parentSubaccountNumber?${nobody}`), { fills: [] });
   same('rest: an address without an account has no orders', await rest(`/v4/orders/parentSubaccountNumber?${nobody}`), []);
-  same('rest: unkept histories answer empty', [await rest(`/v4/pnl/parentSubaccountNumber?${nobody}`), await rest(`/v4/historicalBlockTradingRewards/${OWNER}`)], [{ pnl: [] }, { rewards: [] }]);
+  same('rest: unkept histories answer empty', await rest(`/v4/historicalBlockTradingRewards/${OWNER}`), { rewards: [] });
+  same('rest: the deepest page allowed is still answered', (await rest(`/v4/trades/perpetualMarket/${TICKERS[0]}?limit=1000&page=26`)).trades, []);
+
+  // How long each kind of response may be reused by a cache in front of the API.
+  const cached = async (path) => (await fetch(`${API}${path}`)).headers.get('cache-control');
+  same('rest: live data may be cached for a second, slow history for ten, the clock never', [
+    await cached('/v4/perpetualMarkets'),
+    await cached(`/v4/orderbooks/perpetualMarket/${TICKERS[0]}`),
+    await cached(`/v4/historicalFunding/${TICKERS[0]}`),
+    await cached('/v4/sparklines'),
+    await cached('/v4/time'),
+  ], ['public, max-age=1', 'public, max-age=1', 'public, max-age=10', 'public, max-age=10', 'no-cache, no-store, no-transform']);
+  same('rest: errors, the height and health are not cached', [await cached('/v4/orderbooks/perpetualMarket/NOPE-USD'), await cached('/v4/height'), await cached('/health')], [null, null, null]);
   check('rest: compliance screening answers', (await rest(`/v4/compliance/screen/${OWNER}`)).status === 'COMPLIANT');
 }
 
@@ -845,6 +877,42 @@ async function checkAccounts(early, late, probe) {
         const accrued = BigInt(probe.accounts[String(accountId)].unsettled_funding);
         check(`${label}: ${p.market} net funding is what was settled plus what the engine says accrued`, abs(fixed(p.netFunding) - fixed(settled) - accrued) <= 10n, `${p.netFunding} vs ${settled} + ${accrued}`);
       }
+    }
+
+    // The PnL history against the table. Ticks keep being taken while this runs, so the table
+    // is read first and the response is compared up to the newest tick the table had.
+    const tickRows = sql(`SELECT bucket_ms, checkpoint::text AS height, trim_scale(equity)::text AS equity, trim_scale(net_transfers)::text AS net_transfers, trim_scale(total_pnl)::text AS total_pnl FROM pnl_ticks WHERE account_id = ${accountId} ORDER BY bucket_ms DESC LIMIT 1000`);
+    const { pnl } = await rest(`/v4/pnl/parentSubaccountNumber?${query}`);
+    conforms(`${label} pnl ticks`, 'pnlTick', pnl);
+    check(`${label}: ticks of its PnL history were taken`, tickRows.length >= 3, `${tickRows.length} ticks`);
+    const at = (tick) => new Date(tick.createdAt).getTime();
+    if (tickRows.length >= 3) {
+      const known = pnl.filter((t) => at(t) <= Number(tickRows[0].bucket_ms));
+      same(`${label}: PnL ticks over REST are the table's, newest first`, known.map((t) => [at(t), t.createdAtHeight, t.equity, t.netTransfers, t.totalPnl]), tickRows.map((t) => [Number(t.bucket_ms), t.height, t.equity, t.net_transfers, t.total_pnl]));
+      check(`${label}: every tick's PnL is its equity less what was transferred in`, pnl.every((t) => fixed(t.totalPnl) === fixed(t.equity) - fixed(t.netTransfers)));
+      // Collateral is worth 1 in the scenario, so net transfers in USD are the coins moved.
+      const [{ net }] = sql(`SELECT COALESCE(SUM(CASE kind WHEN 'deposit' THEN amount ELSE -amount END), 0)::text AS net FROM collateral_transfers WHERE account_id = ${accountId} AND kind IN ('deposit', 'withdraw')`);
+      check(`${label}: the latest tick's net transfers are its deposits less its withdrawals`, fixed(pnl[0].netTransfers) === BigInt(net) * 10n ** BigInt(18 - DECIMALS), `${pnl[0].netTransfers} vs ${net}`);
+      // Nothing has traded since the scenario ended, so the latest tick valued the account as
+      // it is now, but for the mark price's funding component, which decays with time.
+      const now = fixed((await rest(`/v4/addresses/${OWNER}/parentSubaccountNumber/${parent}`)).subaccount.equity);
+      const ticked = fixed((await rest(`/v4/pnl/parentSubaccountNumber?${query}&limit=1`)).pnl[0].equity);
+      check(`${label}: the latest tick's equity is the account's equity`, abs(ticked - now) <= abs(now) / 1000n + 10n ** 9n, `${ticked} vs ${now}`);
+
+      const older = await rest(`/v4/pnl/parentSubaccountNumber?${query}&limit=2&createdBeforeOrAt=${new Date(at(known[1]) - 1000).toISOString()}`);
+      same(`${label}: PnL ticks before a time are the ones that follow it`, older.pnl, known.slice(2, 4));
+      const newer = await rest(`/v4/pnl/parentSubaccountNumber?${query}&createdOnOrAfterHeight=${known[1].createdAtHeight}&createdBeforeOrAtHeight=${known[0].createdAtHeight}`);
+      same(`${label}: PnL ticks between two heights are those ticks`, newer.pnl.filter((t) => at(t) <= at(known[0])), known.slice(0, 2));
+
+      const daily = (await rest(`/v4/pnl/parentSubaccountNumber?${query}&daily=true`)).pnl;
+      const day = (ms) => Math.floor(ms / 86_400_000) * 86_400_000;
+      const firstOfDay = new Map();
+      for (const tick of pnl) firstOfDay.set(day(at(tick)), tick);
+      same(`${label}: the daily PnL history is each day's first tick, at the day's start`, daily.map((t) => [at(t), t.createdAtHeight, t.equity, t.totalPnl]), [...firstOfDay].map(([start, t]) => [start, t.createdAtHeight, t.equity, t.totalPnl]));
+
+      const { historicalPnl } = await rest(`/v4/historical-pnl/parentSubaccountNumber?${query}&limit=5`);
+      conforms(`${label} historical pnl ticks`, 'historicalPnlTick', historicalPnl);
+      check(`${label}: the older PnL endpoint serves the same ticks`, historicalPnl.length === Math.min(5, pnl.length) && historicalPnl.every((t) => at(t) <= new Date(t.blockTime).getTime()));
     }
 
     // What the early client was told, and when.

@@ -89,6 +89,7 @@ diesel::table! {
         creator -> Nullable<Text>,
         created_checkpoint -> Nullable<Int8>,
         created_at_ms -> Nullable<Int8>,
+        net_transfers -> Numeric,
     }
 }
 
@@ -265,5 +266,26 @@ diesel::table! {
         role -> Text,
         owner -> Nullable<Text>,
         updated_checkpoint -> Int8,
+    }
+}
+
+diesel::table! {
+    pnl_ticks (account_id, bucket_ms) {
+        account_id -> Int8,
+        bucket_ms -> Int8,
+        checkpoint -> Int8,
+        timestamp_ms -> Int8,
+        equity -> Numeric,
+        net_transfers -> Numeric,
+        total_pnl -> Numeric,
+    }
+}
+
+diesel::table! {
+    pnl_tick_runs (bucket_ms) {
+        bucket_ms -> Int8,
+        checkpoint -> Int8,
+        timestamp_ms -> Int8,
+        accounts -> Int8,
     }
 }

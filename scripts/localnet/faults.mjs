@@ -11,6 +11,8 @@
 // It starts an API of its own with tight limits and checks that:
 //
 //   - a client that sends too many messages is disconnected;
+//   - a peer that leaves the server's pings unanswered is given up on, and one that answers
+//     them is not;
 //   - a client that stops reading is disconnected instead of growing a queue in the server;
 //   - when the feed falls further behind than it bridges with updates, every client is made to
 //     start over, and can;
@@ -57,6 +59,26 @@ const TICKER = Object.keys(JSON.parse(readFileSync(args.deployment, 'utf8')).mar
 // the indexer commits at once, fewer than pass while the process is frozen below.
 const MAX_ROUND_CHECKPOINTS = 20;
 const FREEZE_MS = 10_000;
+const PING_INTERVAL_S = 3;
+const PONG_TIMEOUT_S = 2;
+
+/** A masked WebSocket frame, as a client sends them: text by default, or a control frame. */
+function frame(text, opcode = 0x1) {
+  const payload = Buffer.from(text);
+  const mask = randomBytes(4);
+  const header = payload.length < 126 ? Buffer.from([0x80 | opcode, 0x80 | payload.length]) : Buffer.from([0x80 | opcode, 0x80 | 126, payload.length >> 8, payload.length & 0xff]);
+  return Buffer.concat([header, mask, payload.map((byte, i) => byte ^ mask[i % 4])]);
+}
+const PONG = 0xa;
+
+/** A raw socket upgraded to a WebSocket, so that nothing answers or reads on the client's behalf. */
+async function rawClient() {
+  const socket = net.connect(PORT, '127.0.0.1');
+  await new Promise((resolve) => socket.once('connect', resolve));
+  socket.write(`GET /v4/ws HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+  await new Promise((resolve) => socket.once('data', resolve));
+  return socket;
+}
 
 const results = [];
 function check(name, ok, detail = '') {
@@ -153,6 +175,8 @@ const api = spawn(
     '--metrics-address', `127.0.0.1:${METRICS_PORT}`,
     '--max-round-checkpoints', String(MAX_ROUND_CHECKPOINTS),
     '--ws-send-timeout-secs', '2',
+    '--ws-ping-interval-secs', String(PING_INTERVAL_S),
+    '--ws-pong-timeout-secs', String(PONG_TIMEOUT_S),
     '--ws-message-rate', '50',
     '--ws-message-burst', '100',
   ],
@@ -175,21 +199,40 @@ check('the API under test comes up healthy', await until(() => healthy(OWN), 20_
   check('the disconnect is counted', m['perp_api_ws_closed_total{reason="rate_limited"}'] === 1);
 }
 
+// ------------------------------------------------- a peer that has gone without closing
+
+{
+  // A peer whose network dropped looks idle, and writes to it keep succeeding. This one reads
+  // what it is sent but never answers a ping, next to a client that does.
+  const polite = client(OWN);
+  await polite.opened;
+  const silent = await rawClient();
+  silent.on('data', () => {});
+  let ended = null;
+  const started = Date.now();
+  silent.once('close', () => { ended = Date.now() - started; });
+  check('the silent peer and the polite client are connected', (await metrics()).perp_api_ws_connections === 2);
+
+  await until(() => ended !== null, (PING_INTERVAL_S + PONG_TIMEOUT_S) * 1000 + 5_000);
+  const floor = (PING_INTERVAL_S + PONG_TIMEOUT_S) * 1000 - 500;
+  check('a peer that answers no ping is given up on, one ping and one timeout later', ended !== null && ended >= floor, `closed after ${ended} ms`);
+  console.log(`    (given up on after ${ended} ms)`);
+  // Two more ping intervals, each of which the polite client answers.
+  await sleep(2 * PING_INTERVAL_S * 1000);
+  const m = await metrics();
+  check('it is counted as unresponsive', m['perp_api_ws_closed_total{reason="unresponsive"}'] === 1, JSON.stringify(Object.entries(m).filter(([k]) => k.includes('ws_closed'))));
+  check('a client that answers its pings stays connected', !polite.closed && m.perp_api_ws_connections === 1, JSON.stringify(polite.closed));
+  polite.socket.close();
+  await until(async () => (await metrics()).perp_api_ws_connections === 0, 5_000);
+}
+
 // ------------------------------------------------------- a client that stops reading
 
 {
-  // A raw socket, so that nothing reads on the client's behalf. It asks for the tape again and
-  // again and never reads the answers: they pile up until the server can write no more.
-  const frame = (text) => {
-    const payload = Buffer.from(text);
-    const mask = randomBytes(4);
-    const header = payload.length < 126 ? Buffer.from([0x81, 0x80 | payload.length]) : Buffer.from([0x81, 0x80 | 126, payload.length >> 8, payload.length & 0xff]);
-    return Buffer.concat([header, mask, payload.map((byte, i) => byte ^ mask[i % 4])]);
-  };
-  const socket = net.connect(PORT, '127.0.0.1');
-  await new Promise((resolve) => socket.once('connect', resolve));
-  socket.write(`GET /v4/ws HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
-  await new Promise((resolve) => socket.once('data', resolve));
+  // It asks for the tape again and again and never reads the answers: they pile up until the
+  // server can write no more. It keeps sending pongs, so it is the writes that give it away
+  // and not the heartbeat.
+  const socket = await rawClient();
   socket.pause();
 
   const before = await metrics();
@@ -201,7 +244,7 @@ check('the API under test comes up healthy', await until(() => healthy(OWN), 20_
   // Paced under the message budget: this client is slow, not abusive.
   while (Date.now() - started < 120_000) {
     if (socket.destroyed) break;
-    socket.write(Buffer.concat([subscribe, unsubscribe]));
+    socket.write(Buffer.concat([subscribe, unsubscribe, frame('', PONG)]));
     await sleep(50);
     const m = await metrics();
     if (m.perp_api_ws_connections === 0) {

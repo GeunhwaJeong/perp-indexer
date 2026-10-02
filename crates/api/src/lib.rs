@@ -10,8 +10,6 @@
 
 pub mod config;
 pub mod db;
-pub mod decimal;
-pub mod engine;
 pub mod error;
 pub mod feed;
 pub mod hub;
@@ -22,3 +20,7 @@ pub mod snapshot;
 pub mod time;
 pub mod views;
 pub mod ws;
+
+// The engine's formulas are shared with the indexer, which values accounts the same way.
+pub use perp_engine as engine;
+pub use perp_engine::decimal;

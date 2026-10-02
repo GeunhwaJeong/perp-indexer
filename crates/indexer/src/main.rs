@@ -48,6 +48,9 @@ struct Args {
         required = true
     )]
     packages: Vec<PackageArg>,
+    /// How often every account is valued for its PnL history, in milliseconds.
+    #[clap(long, default_value_t = 3_600_000, value_parser = clap::value_parser!(i64).range(1_000..))]
+    pnl_tick_interval_ms: i64,
 }
 
 #[tokio::main]
@@ -63,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         metrics_address,
         database_url,
         packages,
+        pnl_tick_interval_ms,
     } = Args::parse();
 
     // A run bounded by --last-checkpoint is a backfill: being interrupted means it did not finish.
@@ -98,7 +102,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
     indexer
-        .sequential_pipeline(State::new(packages), Default::default())
+        .sequential_pipeline(
+            State::new(packages, pnl_tick_interval_ms),
+            Default::default(),
+        )
         .await?;
 
     let s_indexer = indexer.run().await?;

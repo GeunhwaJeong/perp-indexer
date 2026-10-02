@@ -27,6 +27,7 @@ haneul-types.workspace = true
 move-core-types.workspace = true
 telemetry-subscribers.workspace = true
 
+perp-engine.workspace = true
 perp-types.workspace = true
 perp-schema.workspace = true
 

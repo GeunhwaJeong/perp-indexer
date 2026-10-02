@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Geunhwa Jeong
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decimals as the API writes them.
+//! Decimal arithmetic at the engine's precision, and decimals as the API writes them.
 
 use bigdecimal::{BigDecimal, Zero};
 use num_bigint::{BigInt, Sign};

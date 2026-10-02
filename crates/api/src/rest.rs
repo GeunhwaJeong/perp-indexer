@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{MatchedPath, Path, Query, Request, State, WebSocketUpgrade};
-use axum::http::{Method, StatusCode};
+use axum::http::header::CACHE_CONTROL;
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -25,14 +26,15 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
 use crate::config::{Deployment, canonical_address};
-use crate::db::{self, AccountRow, OrderFilter, Page};
+use crate::db::{self, AccountRow, OrderFilter, Page, PnlFilter};
 use crate::error::ApiError;
 use crate::hub::Hub;
 use crate::snapshot;
 use crate::time::{iso, parse_iso};
 use crate::views::{
-    candle_object, fill_object, funding_payment_object, historical_funding_object, order_object,
-    resolution_ms, trade_history_object, trade_object, transfer_object,
+    candle_object, fill_object, funding_payment_object, historical_funding_object,
+    historical_pnl_tick_object, order_object, pnl_tick_object, resolution_ms, trade_history_object,
+    trade_object, transfer_object,
 };
 use crate::ws::{self, WsContext};
 
@@ -55,6 +57,8 @@ pub struct AppState {
     pub book_depth: usize,
     /// The service reports itself unhealthy when the indexed chain time is older than this.
     pub max_lag: Duration,
+    /// The most rows a paged request may skip.
+    pub max_pagination_offset: i64,
 }
 
 type App = State<Arc<AppState>>;
@@ -90,16 +94,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v4/fundingPayments/parentSubaccount",
             get(funding_payments),
         )
-        // Not kept by this indexer. They answer with nothing rather than fail, so the pages
-        // that ask for them still load.
-        .route(
-            "/v4/pnl/parentSubaccountNumber",
-            get(async || Json(json!({"pnl": []}))),
-        )
+        .route("/v4/pnl/parentSubaccountNumber", get(pnl))
         .route(
             "/v4/historical-pnl/parentSubaccountNumber",
-            get(async || Json(json!({"historicalPnl": []}))),
+            get(historical_pnl),
         )
+        // Not kept by this indexer. They answer with nothing rather than fail, so the pages
+        // that ask for them still load.
         .route(
             "/v4/historicalBlockTradingRewards/{address}",
             get(async || Json(json!({"rewards": []}))),
@@ -111,6 +112,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v4/compliance/screen/{address}", get(compliance))
         .route("/v4/ws", get(websocket))
         .route("/health", get(health))
+        .layer(middleware::from_fn(cache_control))
         .layer(middleware::from_fn_with_state(state.clone(), track))
         .layer(CompressionLayer::new())
         .layer(TimeoutLayer::with_status_code(
@@ -139,6 +141,41 @@ async fn track(State(app): App, request: Request, next: Next) -> Response {
         .rest_seconds
         .with_label_values(&[route.as_str()])
         .observe(started.elapsed().as_secs_f64());
+    response
+}
+
+/// How long a response to `route` may be reused, by the client or by a cache in front of the
+/// API. `None` for what must not be cached at all, or is not worth it.
+///
+/// Live data is good for a second, which is enough for a cache to absorb a burst of identical
+/// requests; history that only grows at funding or tick intervals is good for ten.
+fn cache_directive(route: &str) -> Option<&'static str> {
+    match route {
+        "/v4/time" => Some("no-cache, no-store, no-transform"),
+        "/v4/height" | "/v4/compliance/screen/{address}" | "/v4/ws" | "/health" => None,
+        "/v4/sparklines"
+        | "/v4/historicalFunding/{ticker}"
+        | "/v4/fundingPayments/parentSubaccount"
+        | "/v4/pnl/parentSubaccountNumber"
+        | "/v4/historical-pnl/parentSubaccountNumber"
+        | "/v4/historicalBlockTradingRewards/{address}"
+        | "/v4/historicalTradingRewardAggregations/{address}" => Some("public, max-age=10"),
+        _ => Some("public, max-age=1"),
+    }
+}
+
+/// Says how long a successful response may be cached.
+async fn cache_control(request: Request, next: Next) -> Response {
+    let directive = request
+        .extensions()
+        .get::<MatchedPath>()
+        .and_then(|path| cache_directive(path.as_str()));
+    let mut response = next.run(request).await;
+    if let Some(directive) = directive.filter(|_| response.status().is_success()) {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static(directive));
+    }
     response
 }
 
@@ -223,6 +260,9 @@ struct Params {
     page: Option<String>,
     created_before_or_at_height: Option<String>,
     created_before_or_at: Option<String>,
+    created_on_or_after_height: Option<String>,
+    created_on_or_after: Option<String>,
+    daily: Option<String>,
     effective_before_or_at_height: Option<String>,
     effective_before_or_at: Option<String>,
     after_or_at: Option<String>,
@@ -264,15 +304,25 @@ fn limit(params: &Params, default: i64) -> Result<i64, ApiError> {
 }
 
 /// A page of a history, and whether the request asked for page numbering.
-fn page(params: &Params) -> Result<(Page, bool), ApiError> {
+///
+/// Skipping rows costs the database as much as returning them, so a request may skip at most
+/// `max_offset`; past that, a client narrows the time range instead of paging deeper.
+fn page(params: &Params, max_offset: i64) -> Result<(Page, bool), ApiError> {
     let limit = limit(params, DEFAULT_LIMIT)?;
     let number = integer("page", &params.page)?;
     if number == Some(0) {
         return Err(ApiError::bad_request("page must be a positive integer"));
     }
+    let offset = number.map_or(0, |n| (n - 1).saturating_mul(limit));
+    if offset > max_offset {
+        return Err(ApiError::bad_request(
+            "page/limit combination requests an offset that exceeds the maximum. Narrow your \
+             query using the createdBeforeOrAt time-range filter instead of paging deeper.",
+        ));
+    }
     let page = Page {
         limit,
-        offset: number.map(|n| (n - 1) * limit).unwrap_or(0),
+        offset,
         before_checkpoint: integer(
             "createdBeforeOrAtHeight",
             &params.created_before_or_at_height,
@@ -374,7 +424,7 @@ async fn trades(
     Query(params): Query<Params>,
 ) -> ApiResult {
     let market = market(&app, &ticker)?;
-    let (page, _) = page(&params)?;
+    let (page, _) = page(&params, app.max_pagination_offset)?;
     let rows = db::market_trades(&mut app.db.connect().await?, market, page).await?;
     let trades: Vec<_> = rows.iter().map(trade_object).collect();
     Ok(Json(json!({"trades": trades})))
@@ -539,7 +589,7 @@ async fn account_fills(
     let ids = app.deployment.market_ids();
     let rows = db::account_fills(conn, &ids, account.account_id, market, page).await?;
     let total = if numbered {
-        Some(db::count_account_fills(conn, &ids, account.account_id, market).await?)
+        Some(db::count_account_fills(conn, &ids, account.account_id, market, page).await?)
     } else {
         None
     };
@@ -548,7 +598,7 @@ async fn account_fills(
 
 async fn fills(State(app): App, Query(params): Query<Params>) -> ApiResult {
     let (address, parent) = account_key(&params)?;
-    let (page, numbered) = page(&params)?;
+    let (page, numbered) = page(&params, app.max_pagination_offset)?;
     let market = market_filter(&app, &params.ticker.or(params.market))?;
     let (rows, total) = account_fills(&app, &address, parent, market, page, numbered).await?;
     let fills: Vec<_> = rows
@@ -566,7 +616,7 @@ async fn fills(State(app): App, Query(params): Query<Params>) -> ApiResult {
 
 async fn trade_history(State(app): App, Query(params): Query<Params>) -> ApiResult {
     let (address, parent) = account_key(&params)?;
-    let (page, numbered) = page(&params)?;
+    let (page, numbered) = page(&params, app.max_pagination_offset)?;
     let market = market_filter(&app, &params.market.or(params.ticker))?;
     let (rows, total) = account_fills(&app, &address, parent, market, page, numbered).await?;
     let history: Vec<_> = rows
@@ -584,14 +634,14 @@ async fn trade_history(State(app): App, Query(params): Query<Params>) -> ApiResu
 
 async fn transfers(State(app): App, Query(params): Query<Params>) -> ApiResult {
     let (address, parent) = account_key(&params)?;
-    let (page, numbered) = page(&params)?;
+    let (page, numbered) = page(&params, app.max_pagination_offset)?;
     let conn = &mut app.db.connect().await?;
     let account = account(conn, &app.deployment, &address, parent)
         .await?
         .ok_or_else(|| no_subaccount(&address, parent))?;
     let rows = db::account_transfers(conn, account.account_id, page).await?;
     let total = if numbered {
-        Some(db::count_account_transfers(conn, account.account_id).await?)
+        Some(db::count_account_transfers(conn, account.account_id, page).await?)
     } else {
         None
     };
@@ -605,7 +655,7 @@ async fn transfers(State(app): App, Query(params): Query<Params>) -> ApiResult {
 
 async fn funding_payments(State(app): App, Query(params): Query<Params>) -> ApiResult {
     let (address, parent) = account_key(&params)?;
-    let (page, numbered) = page(&params)?;
+    let (page, numbered) = page(&params, app.max_pagination_offset)?;
     let after_ms = timestamp("afterOrAt", &params.after_or_at)?;
     let market = market_filter(&app, &params.ticker)?;
     let conn = &mut app.db.connect().await?;
@@ -624,7 +674,7 @@ async fn funding_payments(State(app): App, Query(params): Query<Params>) -> ApiR
             )
             .await?;
             let total = if numbered {
-                Some(db::count_account_funding_payments(conn, &ids, id, market).await?)
+                Some(db::count_account_funding_payments(conn, &ids, id, market, after_ms).await?)
             } else {
                 None
             };
@@ -644,9 +694,53 @@ async fn funding_payments(State(app): App, Query(params): Query<Params>) -> ApiR
     Ok(paged(json!({"fundingPayments": payments}), page, total))
 }
 
+/// The ticks of an account's PnL history that a request asks for, newest first.
+async fn pnl_ticks(app: &AppState, params: &Params) -> Result<Vec<db::PnlTickRow>, ApiError> {
+    let (address, parent) = account_key(params)?;
+    let daily = match params.daily.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(ApiError::bad_request("daily must be true or false")),
+    };
+    let filter = PnlFilter {
+        daily,
+        before_checkpoint: integer(
+            "createdBeforeOrAtHeight",
+            &params.created_before_or_at_height,
+        )?,
+        before_ms: timestamp("createdBeforeOrAt", &params.created_before_or_at)?,
+        after_checkpoint: integer("createdOnOrAfterHeight", &params.created_on_or_after_height)?,
+        after_ms: timestamp("createdOnOrAfter", &params.created_on_or_after)?,
+        limit: limit(params, DEFAULT_LIMIT)?,
+    };
+    let conn = &mut app.db.connect().await?;
+    let account = account(conn, &app.deployment, &address, parent)
+        .await?
+        .ok_or_else(|| no_subaccount(&address, parent))?;
+    Ok(db::account_pnl_ticks(conn, account.account_id, filter).await?)
+}
+
+async fn pnl(State(app): App, Query(params): Query<Params>) -> ApiResult {
+    let rows = pnl_ticks(&app, &params).await?;
+    let ticks: Vec<_> = rows.iter().map(pnl_tick_object).collect();
+    Ok(Json(json!({"pnl": ticks})))
+}
+
+async fn historical_pnl(State(app): App, Query(params): Query<Params>) -> ApiResult {
+    let rows = pnl_ticks(&app, &params).await?;
+    let ticks: Vec<_> = rows.iter().map(historical_pnl_tick_object).collect();
+    Ok(Json(json!({"historicalPnl": ticks})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MAX_OFFSET: i64 = 25_000;
+
+    fn paged(params: &Params) -> Result<(Page, bool), ApiError> {
+        page(params, MAX_OFFSET)
+    }
 
     fn params(pairs: &[(&str, &str)]) -> Params {
         let object: serde_json::Map<String, Value> = pairs
@@ -658,13 +752,13 @@ mod tests {
 
     #[test]
     fn pages_are_one_based_and_capped() {
-        let (page, numbered) = page(&params(&[])).unwrap();
+        let (page, numbered) = paged(&params(&[])).unwrap();
         assert_eq!((page.limit, page.offset, numbered), (1_000, 0, false));
 
-        let (page, numbered) = super::page(&params(&[("limit", "50"), ("page", "3")])).unwrap();
+        let (page, numbered) = paged(&params(&[("limit", "50"), ("page", "3")])).unwrap();
         assert_eq!((page.limit, page.offset, numbered), (50, 100, true));
 
-        let (page, _) = super::page(&params(&[
+        let (page, _) = paged(&params(&[
             ("limit", "999999"),
             ("createdBeforeOrAtHeight", "77"),
             ("createdBeforeOrAt", "1970-01-01T00:00:01.000Z"),
@@ -683,8 +777,40 @@ mod tests {
             ("page", "x"),
             ("createdBeforeOrAt", "now"),
         ] {
-            assert!(super::page(&params(&[bad])).is_err(), "{bad:?}");
+            assert!(paged(&params(&[bad])).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_request_may_not_skip_more_rows_than_the_cap() {
+        // 25 pages of 1,000 skip 24,000 rows; the 26th skips exactly the cap.
+        for (number, allowed) in [("25", true), ("26", true), ("27", false)] {
+            let result = paged(&params(&[("page", number)]));
+            assert_eq!(result.is_ok(), allowed, "page {number}");
+        }
+        assert!(paged(&params(&[("limit", "100"), ("page", "251")])).is_ok());
+        assert!(paged(&params(&[("limit", "100"), ("page", "252")])).is_err());
+        // A page number that would overflow is refused, not wrapped.
+        let huge = i64::MAX.to_string();
+        assert!(paged(&params(&[("page", huge.as_str())])).is_err());
+    }
+
+    #[test]
+    fn responses_say_how_long_they_may_be_cached() {
+        assert_eq!(
+            cache_directive("/v4/orderbooks/perpetualMarket/{ticker}"),
+            Some("public, max-age=1")
+        );
+        assert_eq!(
+            cache_directive("/v4/pnl/parentSubaccountNumber"),
+            Some("public, max-age=10")
+        );
+        assert_eq!(
+            cache_directive("/v4/time"),
+            Some("no-cache, no-store, no-transform")
+        );
+        assert_eq!(cache_directive("/v4/height"), None);
+        assert_eq!(cache_directive("/health"), None);
     }
 
     #[test]

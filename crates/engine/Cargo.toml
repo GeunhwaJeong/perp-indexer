@@ -1,0 +1,10 @@
+[package]
+name = "perp-engine"
+version = "0.1.0"
+license = "Apache-2.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+bigdecimal.workspace = true
+num-bigint.workspace = true

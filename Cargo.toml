@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/types", "crates/indexer", "crates/schema", "crates/api"]
+members = ["crates/types", "crates/engine", "crates/indexer", "crates/schema", "crates/api"]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -26,6 +26,7 @@ tower-http = { version = "0.6", features = ["cors", "compression-gzip", "timeout
 tracing = "0.1"
 url = "2.5"
 
+perp-engine = { path = "crates/engine" }
 perp-types = { path = "crates/types" }
 perp-schema = { path = "crates/schema" }
 

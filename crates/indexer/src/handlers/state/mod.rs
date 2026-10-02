@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The state pipeline: markets, accounts and their capabilities, positions, orders, fills,
-//! candles, funding, collateral transfers and order tickets, maintained in chain order.
+//! candles, funding, collateral transfers, order tickets and the history of what accounts were
+//! worth, maintained in chain order.
 //!
 //! Unlike the ledger, these tables depend on the order changes are applied in, so the pipeline is
 //! sequential: every batch of checkpoints is written in one database transaction together with
@@ -22,14 +23,20 @@ pub mod batch;
 pub mod change;
 pub mod episode;
 pub mod extract;
+pub mod pnl;
 
 pub struct State {
     packages: Packages,
+    /// How often accounts are valued for their PnL history, in milliseconds.
+    pnl_tick_interval_ms: i64,
 }
 
 impl State {
-    pub fn new(packages: Packages) -> Self {
-        Self { packages }
+    pub fn new(packages: Packages, pnl_tick_interval_ms: i64) -> Self {
+        Self {
+            packages,
+            pnl_tick_interval_ms,
+        }
     }
 }
 
@@ -60,6 +67,7 @@ impl Handler for State {
         batch: &batch::Batch,
         conn: &mut Connection<'a>,
     ) -> anyhow::Result<usize> {
-        apply::commit(batch, conn).await
+        let rows = apply::commit(batch, conn).await?;
+        Ok(rows + pnl::tick(self.pnl_tick_interval_ms, conn).await?)
     }
 }

@@ -239,9 +239,13 @@ pub struct HistoricalFunding {
 pub struct TradeHistory {
     pub id: String,
     pub market_id: String,
+    /// Left out when the fill has no order, never `null`: the front end's check of this
+    /// object takes a string or nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,
     pub side: &'static str,
     pub position_side: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_price: Option<String>,
     pub execution_price: String,
     pub value: String,

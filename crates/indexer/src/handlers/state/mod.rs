@@ -24,6 +24,7 @@ pub mod change;
 pub mod episode;
 pub mod extract;
 pub mod pnl;
+pub mod taker;
 
 pub struct State {
     packages: Packages,

@@ -500,6 +500,8 @@ const SHAPES = {
   tradeHistory: {
     id: str,
     marketId: str,
+    // A string or absent. The front end's check of this object refuses null here.
+    orderId: (v) => v === undefined || typeof v === 'string',
     side: oneOf('BUY', 'SELL'),
     positionSide: oneOf('LONG', 'SHORT'),
     entryPrice: dec,
@@ -683,10 +685,15 @@ async function checkPublicRest(late, probe) {
       const rows = sql(`SELECT start_ms, trim_scale(open)::text AS open, trim_scale(high)::text AS high, trim_scale(low)::text AS low, trim_scale(close)::text AS close, trim_scale(base_volume)::text AS base, trim_scale(quote_volume)::text AS quote, trades FROM candles WHERE market = '${id}' AND resolution_ms = ${ms} ORDER BY start_ms DESC`);
       same(`rest: ${ticker} ${resolution} candles are the table's, newest first`, candles.map((c) => [Date.parse(c.startedAt), c.open, c.high, c.low, c.close, c.baseTokenVolume, c.usdVolume, c.trades]), rows.map((r) => [r.start_ms, r.open, r.high, r.low, r.close, r.base, r.quote, r.trades]));
       check(`rest: ${ticker} ${resolution} candles count every trade once`, candles.reduce((n, c) => n + c.trades, 0) === fills.length, `${candles.reduce((n, c) => n + c.trades, 0)} vs ${fills.length}`);
-      if (candles.length > 1) {
-        const last = candles.at(-1).startedAt;
-        const ranged = await rest(`/v4/candles/perpetualMarkets/${ticker}?resolution=${resolution}&toISO=${last}&limit=1`);
-        same(`rest: ${ticker} ${resolution} candles honour toISO and limit`, ranged.candles, [candles.at(-1)]);
+      if (candles.length > 0) {
+        // toISO is exclusive: the chart asks for what comes before the oldest candle it has.
+        const justAfter = new Date(Date.parse(candles.at(-1).startedAt) + 1).toISOString();
+        const before = await rest(`/v4/candles/perpetualMarkets/${ticker}?resolution=${resolution}&toISO=${justAfter}&limit=1`);
+        same(`rest: ${ticker} ${resolution} candles before a time are the ones that started before it`, before.candles, [candles.at(-1)]);
+        const none = await rest(`/v4/candles/perpetualMarkets/${ticker}?resolution=${resolution}&toISO=${candles.at(-1).startedAt}`);
+        same(`rest: ${ticker} ${resolution} there are no candles before the oldest`, none.candles, []);
+        const from = await rest(`/v4/candles/perpetualMarkets/${ticker}?resolution=${resolution}&fromISO=${candles.at(-1).startedAt}&limit=1000`);
+        same(`rest: ${ticker} ${resolution} candles from a time include the one at it`, from.candles.at(-1), candles.at(-1));
       }
     }
 

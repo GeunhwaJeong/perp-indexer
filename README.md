@@ -149,9 +149,15 @@ end's own arithmetic stays true.
   here rather than copied; `crates/engine` restates the engine's formulas for them.
 - **Amounts.** Balances are in USD at the collateral's oracle price. Deposits and withdrawals are
   in coins. The quote asset is presented as `USDC`, the symbol the front end knows.
-- **Orders.** Only orders that rest on the book are indexed, as `LIMIT` orders whose `id` is the
-  engine's order ID. An order that fills at once shows as fills only. Stop and TWAP tickets
-  commit to their details by hash, so they are not presented as orders.
+- **Orders.** An order that rests on the book is a `LIMIT` order whose `id` is the engine's
+  order ID. The engine reports no order for what crosses the book, only the fills, so the
+  indexer gives each taker fill one: if its transaction posted a single order of the same
+  account, market and side, the fill is the part of that order that crossed and counts toward
+  its size and filled size; otherwise it becomes a `MARKET` order of its own, already filled,
+  with an ID above 2^128 that names nothing on chain. Stop and TWAP tickets commit to their
+  details by hash, so they are not presented as orders.
+- **Candles.** `fromISO` is inclusive and `toISO` exclusive, as in the dYdX indexer. The chart
+  pages backwards by asking for the candles before the oldest one it holds.
 - **Fills.** Liquidations appear as `LIQUIDATED` and `LIQUIDATION`, auto-deleveraging and
   settlement as `DELEVERAGED` and `OFFSETTING`. The tape (`v4_trades`) has each match once, with
   the taker's side.

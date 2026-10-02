@@ -281,6 +281,9 @@ pub struct OrderRow {
     pub filled: BigDecimal,
     #[diesel(sql_type = Text)]
     pub status: String,
+    /// 'limit' for an order the engine posted, 'market' for one made out of a taker fill.
+    #[diesel(sql_type = Text)]
+    pub kind: String,
     #[diesel(sql_type = Nullable<SmallInt>)]
     pub cancel_reason: Option<i16>,
     #[diesel(sql_type = Bool)]
@@ -298,7 +301,7 @@ pub struct OrderRow {
 }
 
 const ORDER_COLUMNS: &str = "o.market, m.market_index, o.order_id, o.account_id, o.is_ask, \
-     o.price, o.size, o.filled, o.status, o.cancel_reason, o.reduce_only, \
+     o.price, o.size, o.filled, o.status, o.kind, o.cancel_reason, o.reduce_only, \
      o.expiration_timestamp_ms, o.client_order_id, o.created_checkpoint, o.updated_checkpoint, \
      o.updated_at_ms \
      FROM orders o JOIN markets m ON m.market = o.market AND m.market_index IS NOT NULL";
@@ -405,13 +408,17 @@ pub struct FillRow {
     pub position_base_before: Option<BigDecimal>,
     #[diesel(sql_type = Nullable<Numeric>)]
     pub entry_price_before: Option<BigDecimal>,
+    /// The kind of the fill's order, when it has one.
+    #[diesel(sql_type = Nullable<Text>)]
+    pub order_kind: Option<String>,
 }
 
 const FILL_COLUMNS: &str = "f.checkpoint, f.tx_index, f.event_index, f.fill_index, \
      f.timestamp_ms, f.market, m.market_index, m.settlement_base_price, f.account_id, f.is_ask, \
      f.liquidity, f.kind, f.price, f.size, f.fee, f.integrator_fee, f.pnl, f.order_id, \
-     f.client_order_id, f.position_base_before, f.entry_price_before \
-     FROM fills f JOIN markets m ON m.market = f.market AND m.market_index IS NOT NULL";
+     f.client_order_id, f.position_base_before, f.entry_price_before, fo.kind AS order_kind \
+     FROM fills f JOIN markets m ON m.market = f.market AND m.market_index IS NOT NULL \
+     LEFT JOIN orders fo ON fo.market = f.market AND fo.order_id = f.order_id";
 
 /// Newest first.
 const FILL_ORDER: &str =
@@ -576,7 +583,9 @@ pub struct CandleRow {
 const CANDLE_COLUMNS: &str = "market, resolution_ms, start_ms, open, high, low, close, \
      base_volume, quote_volume, trades FROM candles";
 
-/// A market's candles at one resolution, newest first.
+/// A market's candles at one resolution, newest first. `from_ms` is inclusive and `to_ms`
+/// exclusive, as in the dYdX indexer: the chart pages backwards by asking for the candles
+/// before the oldest one it holds, and would be handed that candle again for ever otherwise.
 pub async fn candles(
     conn: &mut Connection<'_>,
     market: &str,
@@ -589,7 +598,7 @@ pub async fn candles(
         "SELECT {CANDLE_COLUMNS} \
          WHERE market = $1 AND resolution_ms = $2 \
            AND ($3::BIGINT IS NULL OR start_ms >= $3) \
-           AND ($4::BIGINT IS NULL OR start_ms <= $4) \
+           AND ($4::BIGINT IS NULL OR start_ms < $4) \
          ORDER BY start_ms DESC LIMIT $5"
     ))
     .bind::<Text, _>(market)

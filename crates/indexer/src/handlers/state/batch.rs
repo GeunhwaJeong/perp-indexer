@@ -336,6 +336,7 @@ mod tests {
             filled: dec("0"),
             canceled: dec("0"),
             status: "open".to_owned(),
+            kind: "limit".to_owned(),
             cancel_reason: None,
             reduce_only: false,
             expiration_timestamp_ms: None,

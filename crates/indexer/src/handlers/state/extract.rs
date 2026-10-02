@@ -26,6 +26,7 @@ use serde_json::json;
 use tracing::warn;
 
 use super::change::{Change, MarketPrices, OrderUpdate, TicketChange};
+use super::taker::attribute_taker_fills;
 use crate::convert::{b9, ifixed, int8, integer, oracle_price, order_side_and_price};
 use crate::packages::Packages;
 
@@ -51,6 +52,7 @@ pub fn changes(checkpoint: &Checkpoint, packages: &Packages) -> anyhow::Result<V
     let mut out = vec![];
     for (tx_index, tx) in checkpoint.transactions.iter().enumerate() {
         let tx_digest = tx.effects.transaction_digest().to_string();
+        let tx_start = out.len();
 
         for (event_index, event) in tx.events.iter().flat_map(|e| &e.data).enumerate() {
             let Some(decoder) = packages.get(&event.type_.address).and_then(|p| p.decoder) else {
@@ -90,6 +92,8 @@ pub fn changes(checkpoint: &Checkpoint, packages: &Packages) -> anyhow::Result<V
                 PerpEvent::OracleAggregator(event) => oracle_event(&ctx, event, &mut out)?,
             }
         }
+
+        attribute_taker_fills(&mut out, tx_start, &tx_digest);
 
         let mut written = HashSet::new();
         for object in tx.output_objects(&checkpoint.object_set) {
@@ -261,6 +265,7 @@ fn perpetuals_event(
                 filled: BigDecimal::zero(),
                 canceled: BigDecimal::zero(),
                 status: "open".to_owned(),
+                kind: "limit".to_owned(),
                 cancel_reason: None,
                 reduce_only: e.reduce_only,
                 expiration_timestamp_ms: e.expiration_timestamp_ms.map(integer),

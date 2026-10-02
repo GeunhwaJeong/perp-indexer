@@ -125,6 +125,8 @@ pub struct Order {
     pub created_tx: String,
     pub updated_checkpoint: i64,
     pub updated_at_ms: i64,
+    /// 'limit' for an order the engine posted, 'market' for one made out of a taker fill.
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Queryable, Selectable, Insertable)]

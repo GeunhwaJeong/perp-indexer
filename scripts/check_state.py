@@ -217,6 +217,27 @@ def check_invariants(args, c):
     """)
     c.eq("funded accounts missing from the latest pnl ticks", len(bad), 0)
 
+    # An order that crossed the book is reported only as fills, so each taker fill is given an
+    # order: the one its transaction posted, or a market order of its own.
+    bad = rows(args, """
+        SELECT f.checkpoint, f.tx_index, f.event_index FROM fills f
+        LEFT JOIN orders o ON o.market = f.market AND o.order_id = f.order_id
+        WHERE f.kind = 'trade' AND o.order_id IS NULL
+    """)
+    c.eq("trades without an order", len(bad), 0)
+    bad = rows(args, """
+        SELECT o.market, o.order_id FROM orders o
+        WHERE o.filled <> (SELECT coalesce(sum(f.size), 0) FROM fills f
+                            WHERE f.market = o.market AND f.order_id = o.order_id AND f.kind = 'trade')
+    """)
+    c.eq("orders whose filled size is not the sum of their fills", len(bad), 0)
+    bad = rows(args, """
+        SELECT market, order_id FROM orders
+        WHERE kind = 'market' AND (status <> 'filled' OR order_id < 2::numeric ^ 128)
+           OR kind = 'limit' AND order_id >= 2::numeric ^ 128
+    """)
+    c.eq("market orders that are not filled, or IDs on the wrong side of 2^128", len(bad), 0)
+
     # Orders and candles are consistent with themselves and with the fills.
     bad = rows(args, """
         SELECT market, order_id FROM orders

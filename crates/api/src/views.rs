@@ -183,6 +183,8 @@ pub fn order_id(id: &BigDecimal) -> String {
 
 pub fn order_object(row: &OrderRow, ticker: &str, parent: i64) -> Order {
     let subaccount_number = child_number(parent, row.market_index);
+    // An order that filled at once and never rested on the book.
+    let market = row.kind == "market";
     let (status, removal_reason) = match row.status.as_str() {
         "open" => ("OPEN", None),
         "filled" => ("FILLED", None),
@@ -213,8 +215,7 @@ pub fn order_object(row: &OrderRow, ticker: &str, parent: i64) -> Order {
         size: plain(&row.size),
         total_filled: plain(&row.filled),
         price: plain(&row.price),
-        // Only orders that rest on the book are indexed, and those are limit orders.
-        order_type: "LIMIT",
+        order_type: if market { "MARKET" } else { "LIMIT" },
         reduce_only: row.reduce_only,
         // dYdX's flag for orders that live on chain until filled, canceled or expired.
         order_flags: "64",
@@ -224,8 +225,9 @@ pub fn order_object(row: &OrderRow, ticker: &str, parent: i64) -> Order {
             .and_then(|ms| ms.to_i64())
             .map(iso),
         created_at_height: height(row.created_checkpoint),
-        client_metadata: "0",
-        time_in_force: "GTT",
+        // dYdX's mark of a market order, which the front end reads off orders and fills.
+        client_metadata: if market { "1" } else { "0" },
+        time_in_force: if market { "IOC" } else { "GTT" },
         status,
         post_only: false,
         ticker: ticker.to_owned(),
@@ -278,7 +280,7 @@ pub fn fill_object(row: &FillRow, ticker: &str, parent: i64) -> Fill {
         created_at: iso(row.timestamp_ms),
         created_at_height: height(row.checkpoint),
         order_id: row.order_id.as_ref().map(order_id),
-        client_metadata: None,
+        client_metadata: (row.order_kind.as_deref() == Some("market")).then_some("1"),
         subaccount_number: child_number(parent, row.market_index),
         builder_fee: (!row.integrator_fee.is_zero()).then(|| plain(&row.integrator_fee)),
         position_size_before: before.map(|base| plain(&base.abs())),
@@ -357,10 +359,10 @@ pub fn trade_history_object(row: &FillRow, ticker: &str, parent: i64) -> TradeHi
         time: iso(row.timestamp_ms),
         action,
         margin_mode: "ISOLATED",
-        order_type: if row.liquidity == "maker" {
-            "LIMIT"
-        } else {
+        order_type: if row.order_kind.as_deref() == Some("market") {
             "MARKET"
+        } else {
+            "LIMIT"
         },
         net_realized_pnl,
         net_realized_pnl_percent,
@@ -757,6 +759,7 @@ mod tests {
             client_order_id: None,
             position_base_before: Some(dec(before)),
             entry_price_before: (dec(before) != dec("0")).then(|| dec("100")),
+            order_kind: None,
         }
     }
 
@@ -878,6 +881,7 @@ mod tests {
             size: dec("1.000000000"),
             filled: dec("0.250000000"),
             status: "open".to_owned(),
+            kind: "limit".to_owned(),
             cancel_reason: None,
             reduce_only: true,
             expiration_timestamp_ms: Some(dec("1000")),
@@ -910,6 +914,14 @@ mod tests {
         );
         row.status = "filled".to_owned();
         assert_eq!(order_object(&row, "BTC-USD", 0).status, "FILLED");
+
+        // An order that filled at once is a market order, marked the way dYdX marks one.
+        row.kind = "market".to_owned();
+        let order = order_object(&row, "BTC-USD", 0);
+        assert_eq!(
+            (order.order_type, order.time_in_force, order.client_metadata),
+            ("MARKET", "IOC", "1")
+        );
     }
 
     #[test]
@@ -988,7 +1000,25 @@ mod tests {
         );
         // 9.5 made on the 100 the closed unit cost.
         assert_eq!(entry.net_realized_pnl_percent.as_deref(), Some("9.5"));
-        assert_eq!(entry.order_type, "MARKET");
+        assert_eq!(entry.order_type, "LIMIT");
+
+        // A fill without an order has no order ID at all, rather than a null one.
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(json.get("orderId").is_none());
+        assert!(json.get("netRealizedPnl").is_some());
+        let mut with_order = fill_row(true, "1", "2", "trade");
+        with_order.order_id = Some(dec("42"));
+        let json = serde_json::to_value(trade_history_object(&with_order, "BTC-USD", 0)).unwrap();
+        assert_eq!(json["orderId"], "42");
+
+        // The order type is the order's: a fill of an order that never rested is a market one.
+        with_order.order_kind = Some("market".to_owned());
+        let market = trade_history_object(&with_order, "BTC-USD", 0);
+        assert_eq!(market.order_type, "MARKET");
+        let fill = fill_object(&with_order, "BTC-USD", 0);
+        assert_eq!((fill.fill_type, fill.client_metadata), ("LIMIT", Some("1")));
+        with_order.order_kind = Some("limit".to_owned());
+        assert_eq!(fill_object(&with_order, "BTC-USD", 0).client_metadata, None);
     }
 
     #[test]

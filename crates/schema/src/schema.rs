@@ -146,6 +146,7 @@ diesel::table! {
         created_tx -> Text,
         updated_checkpoint -> Int8,
         updated_at_ms -> Int8,
+        kind -> Text,
     }
 }
 

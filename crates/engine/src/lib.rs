@@ -237,10 +237,21 @@ impl Position {
     }
 
     /// The larger size the position could reach if all of its bids or all of its asks filled.
-    fn abs_net_base(&self) -> BigDecimal {
+    pub fn abs_net_base(&self) -> BigDecimal {
         let after_bids = (&self.base + &self.bids_quantity).abs();
         let after_asks = (&self.base - &self.asks_quantity).abs();
         after_bids.max(after_asks)
+    }
+
+    /// The margin a liquidation compares with (`position::margin_requirement` at the market's
+    /// maintenance ratio): the position's largest size with its resting orders, valued at the
+    /// mark price.
+    pub fn maintenance_requirement(
+        &self,
+        mark_price: &BigDecimal,
+        margin_ratio_maintenance: &BigDecimal,
+    ) -> BigDecimal {
+        fixed(self.abs_net_base() * mark_price * margin_ratio_maintenance)
     }
 
     pub fn margin(&self, market: &Valuation) -> Margin {
@@ -415,6 +426,18 @@ mod tests {
         let mut underwater = position("2", "200");
         underwater.collateral = dec("-10");
         assert_eq!(plain(&underwater.margin(&market).collateral_value), "-6");
+    }
+
+    #[test]
+    fn maintenance_counts_the_size_resting_orders_could_add() {
+        let mut long = position("2", "200");
+        // 2 at 90 at 5%.
+        assert_eq!(plain(&long.maintenance_requirement(&dec("90"), &dec("0.05"))), "9");
+        // Resting bids of 1 could make it 3; asks of 4 could make it -2.
+        long.bids_quantity = dec("1");
+        long.asks_quantity = dec("4");
+        assert_eq!(plain(&long.abs_net_base()), "3");
+        assert_eq!(plain(&long.maintenance_requirement(&dec("90"), &dec("0.05"))), "13.5");
     }
 
     #[test]

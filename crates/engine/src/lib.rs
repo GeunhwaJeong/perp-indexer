@@ -432,12 +432,18 @@ mod tests {
     fn maintenance_counts_the_size_resting_orders_could_add() {
         let mut long = position("2", "200");
         // 2 at 90 at 5%.
-        assert_eq!(plain(&long.maintenance_requirement(&dec("90"), &dec("0.05"))), "9");
+        assert_eq!(
+            plain(&long.maintenance_requirement(&dec("90"), &dec("0.05"))),
+            "9"
+        );
         // Resting bids of 1 could make it 3; asks of 4 could make it -2.
         long.bids_quantity = dec("1");
         long.asks_quantity = dec("4");
         assert_eq!(plain(&long.abs_net_base()), "3");
-        assert_eq!(plain(&long.maintenance_requirement(&dec("90"), &dec("0.05"))), "13.5");
+        assert_eq!(
+            plain(&long.maintenance_requirement(&dec("90"), &dec("0.05"))),
+            "13.5"
+        );
     }
 
     #[test]

@@ -599,6 +599,8 @@ mod tests {
             funding_period_ms: 86_400_000,
             initial_margin_fraction: "0.1".to_owned(),
             maintenance_margin_fraction: "0.05".to_owned(),
+            maker_fee: "0.0002".to_owned(),
+            taker_fee: "0.0005".to_owned(),
             open_interest: open_interest.to_owned(),
             atomic_resolution: -9,
             quantum_conversion_exponent: -9,

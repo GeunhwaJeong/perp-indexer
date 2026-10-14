@@ -163,6 +163,8 @@ impl MarketView {
             funding_period_ms: self.pricing.funding_period_ms,
             initial_margin_fraction: plain(&self.row.margin_ratio_initial),
             maintenance_margin_fraction: plain(&self.row.margin_ratio_maintenance),
+            maker_fee: plain(&self.row.maker_fee),
+            taker_fee: plain(&self.row.taker_fee),
             open_interest: open_interest.clone(),
             atomic_resolution: -9,
             quantum_conversion_exponent: -9,
@@ -796,6 +798,8 @@ mod tests {
             settlement_base_price: None,
             lot_size: dec("0.001000000"),
             tick_size: dec("1.000000000"),
+            maker_fee: dec("0.0002"),
+            taker_fee: dec("0.0005"),
             margin_ratio_initial: dec("0.1"),
             margin_ratio_maintenance: dec("0.05"),
             cum_funding_rate_long: dec("2"),
@@ -890,6 +894,10 @@ mod tests {
         assert_eq!(market.next_funding_at, "1970-01-01T02:00:00.000Z");
         assert_eq!(market.funding_period_ms, 86_400_000);
         assert_eq!(market.tick_size, "1");
+        assert_eq!(
+            (market.maker_fee.as_str(), market.taker_fee.as_str()),
+            ("0.0002", "0.0005")
+        );
         assert_eq!(market.step_size, "0.001");
         assert_eq!(market.step_base_quantums, 1_000_000);
         assert_eq!(market.subticks_per_tick, 1_000_000_000);

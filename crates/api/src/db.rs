@@ -84,6 +84,12 @@ pub struct MarketRow {
     pub lot_size: BigDecimal,
     #[diesel(sql_type = Numeric)]
     pub tick_size: BigDecimal,
+    /// The market's base fee rates, as fractions of the notional; the account's tier may
+    /// scale them.
+    #[diesel(sql_type = Numeric)]
+    pub maker_fee: BigDecimal,
+    #[diesel(sql_type = Numeric)]
+    pub taker_fee: BigDecimal,
     #[diesel(sql_type = Numeric)]
     pub margin_ratio_initial: BigDecimal,
     #[diesel(sql_type = Numeric)]
@@ -132,7 +138,8 @@ pub async fn markets(
 ) -> anyhow::Result<Vec<MarketRow>> {
     Ok(sql_query(
         "SELECT m.market, m.market_index, m.paused, m.closed, m.settlement_enabled, \
-                m.settlement_base_price, m.lot_size, m.tick_size, m.margin_ratio_initial, \
+                m.settlement_base_price, m.lot_size, m.tick_size, m.maker_fee, m.taker_fee, \
+                m.margin_ratio_initial, \
                 m.margin_ratio_maintenance, m.cum_funding_rate_long, m.cum_funding_rate_short, \
                 m.funding_last_upd_ms, m.premium_twap, m.spread_twap, m.open_interest, \
                 m.best_ask_price, m.best_bid_price, \

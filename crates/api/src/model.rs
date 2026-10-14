@@ -36,6 +36,9 @@ pub struct PerpetualMarket {
     pub funding_period_ms: i64,
     pub initial_margin_fraction: String,
     pub maintenance_margin_fraction: String,
+    /// The market's base maker and taker fee rates, as fractions of the notional.
+    pub maker_fee: String,
+    pub taker_fee: String,
     pub open_interest: String,
     pub atomic_resolution: i32,
     pub quantum_conversion_exponent: i32,

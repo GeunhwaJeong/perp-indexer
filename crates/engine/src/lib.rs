@@ -288,6 +288,31 @@ impl Position {
             free,
         }
     }
+
+    /// The mark price at which the position becomes liquidatable: where its margin, as
+    /// [`Position::margin`] values it, falls to its maintenance requirement.
+    ///
+    /// Both sides of that equation are linear in the price. The margin is the collateral value
+    /// (which carries the funding accrued so far and does not move with the price) plus
+    /// `base * price - quote`; the requirement is `abs_net_base * price * ratio`. Solving gives
+    /// `(quote - collateral value) / (base - abs_net_base * ratio)`. A long whose collateral
+    /// covers its whole notional has no such price above zero, and a flat position none at all:
+    /// `None` for both.
+    pub fn liquidation_price(
+        &self,
+        margin: &Margin,
+        margin_ratio_maintenance: &BigDecimal,
+    ) -> Option<BigDecimal> {
+        if self.base.is_zero() {
+            return None;
+        }
+        let denominator = &self.base - self.abs_net_base() * margin_ratio_maintenance;
+        if denominator.is_zero() {
+            return None;
+        }
+        let price = fixed((&self.quote_notional - &margin.collateral_value) / denominator);
+        price.is_positive().then_some(price)
+    }
 }
 
 #[cfg(test)]
@@ -457,5 +482,40 @@ mod tests {
         let m = flat.margin(&valuation("100"));
         assert_eq!(plain(&m.required), "30");
         assert_eq!(plain(&m.free), "970");
+    }
+
+    #[test]
+    fn liquidation_price_is_where_margin_meets_the_maintenance_requirement() {
+        let market = valuation("100");
+        let mmr = dec("0.05");
+        let price = |p: &Position| {
+            p.liquidation_price(&p.margin(&market), &mmr)
+                .map(|price| plain(&price))
+        };
+
+        // 2 long from 100 on 20 of collateral: 20 + 2p - 200 = 0.1p at p = 180 / 1.9.
+        let mut long = position("2", "200");
+        long.collateral = dec("20");
+        assert_eq!(price(&long).as_deref(), Some("94.736842105263157894"));
+        // The same short: 20 - 2p + 200 = 0.1p at p = 220 / 2.1.
+        let mut short = position("-2", "-200");
+        short.collateral = dec("20");
+        assert_eq!(price(&short).as_deref(), Some("104.761904761904761904"));
+
+        // Resting bids of 2 could double the long, so the requirement is on 4: 180 / 1.8.
+        long.bids_quantity = dec("2");
+        assert_eq!(price(&long).as_deref(), Some("100"));
+        long.bids_quantity = dec("0");
+
+        // Funding owed (the long rate rose by 0.5 on 2 units) lowers the collateral to 19.
+        let mut owing = market.clone();
+        owing.cum_funding_rate_long = dec("1.5");
+        let p = long.liquidation_price(&long.margin(&owing), &mmr).unwrap();
+        assert_eq!(plain(&p), "95.263157894736842105");
+
+        // 1000 of collateral covers the whole notional: no price liquidates the long.
+        assert_eq!(price(&position("2", "200")), None);
+        // A flat position has nothing to liquidate.
+        assert_eq!(price(&position("0", "0")), None);
     }
 }

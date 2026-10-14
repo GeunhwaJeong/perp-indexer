@@ -26,15 +26,15 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
 use crate::config::{Deployment, canonical_address};
-use crate::db::{self, AccountRow, OrderFilter, Page, PnlFilter};
+use crate::db::{self, AccountRow, OrderFilter, Page, PnlFilter, TicketFilter};
 use crate::error::ApiError;
 use crate::hub::Hub;
 use crate::snapshot;
 use crate::time::{iso, parse_iso};
 use crate::views::{
     candle_object, fill_object, funding_payment_object, historical_funding_object,
-    historical_pnl_tick_object, order_object, pnl_tick_object, resolution_ms, trade_history_object,
-    trade_object, transfer_object,
+    historical_pnl_tick_object, order_object, pnl_tick_object, resolution_ms, ticket_object,
+    trade_history_object, trade_object, transfer_object,
 };
 use crate::ws::{self, WsContext};
 
@@ -84,6 +84,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(parent_subaccount),
         )
         .route("/v4/orders/parentSubaccountNumber", get(orders))
+        .route(
+            "/v4/orderTickets/parentSubaccountNumber",
+            get(order_tickets),
+        )
         .route("/v4/fills/parentSubaccountNumber", get(fills))
         .route("/v4/transfers/parentSubaccountNumber", get(transfers))
         .route(
@@ -256,6 +260,9 @@ struct Params {
     market: Option<String>,
     side: Option<String>,
     status: Option<String>,
+    /// `STOP` or `TWAP`, for order tickets.
+    #[serde(rename = "type")]
+    ticket_type: Option<String>,
     limit: Option<String>,
     page: Option<String>,
     created_before_or_at_height: Option<String>,
@@ -574,6 +581,52 @@ async fn orders(State(app): App, Query(params): Query<Params>) -> ApiResult {
 
 /// A page of an account's fills, with the total when the request asked for page numbering. An
 /// address without an account has none.
+async fn order_tickets(State(app): App, Query(params): Query<Params>) -> ApiResult {
+    let (address, parent) = account_key(&params)?;
+    let kind = match params.ticket_type.as_deref() {
+        None => None,
+        Some("STOP") => Some("stop"),
+        Some("TWAP") => Some("twap"),
+        Some(_) => return Err(ApiError::bad_request("type must be STOP or TWAP")),
+    };
+    let status = match params.status.as_deref() {
+        None => None,
+        Some("OPEN") => Some("open"),
+        Some("EXECUTED") => Some("executed"),
+        Some("FINALIZED") => Some("finalized"),
+        Some("CANCELED") => Some("canceled"),
+        Some("DELETED") => Some("deleted"),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "status must be a valid ticket status",
+            ));
+        }
+    };
+    let filter = TicketFilter {
+        kind: kind.map(str::to_owned),
+        status: status.map(str::to_owned),
+        market: market_filter(&app, &params.ticker)?.map(str::to_owned),
+        limit: limit(&params, DEFAULT_LIMIT)?,
+    };
+    let conn = &mut app.db.connect().await?;
+    let Some(account) = account(conn, &app.deployment, &address, parent).await? else {
+        return Ok(Json(json!({"tickets": []})));
+    };
+    let ids = app.deployment.market_ids();
+    let rows = db::account_order_tickets(conn, &ids, account.account_id, &filter).await?;
+    let tickets: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let ticker = row
+                .market
+                .as_deref()
+                .and_then(|market| app.deployment.ticker(market));
+            ticket_object(row, ticker, parent)
+        })
+        .collect();
+    Ok(Json(json!({"tickets": tickets})))
+}
+
 async fn account_fills(
     app: &AppState,
     address: &str,

@@ -15,9 +15,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use bigdecimal::{BigDecimal, Signed, ToPrimitive, Zero};
 
+use serde::Deserialize;
+
 use crate::db::{
     AccountRow, CandleRow, FillRow, FundingPaymentRow, FundingUpdateRow, MarketRow, MarketStatsRow,
-    OrderRow, PnlTickRow, PositionRow, TransferRow,
+    OrderRow, OrderTicketRow, PnlTickRow, PositionRow, TransferRow,
 };
 use crate::decimal::{plain, pow10, ratio};
 use crate::engine::{
@@ -25,8 +27,8 @@ use crate::engine::{
 };
 use crate::model::{
     AssetPosition, Candle, Fill, FundingPayment, HistoricalFunding, HistoricalPnlTick, Order,
-    ParentSubaccount, PerpetualMarket, PerpetualPosition, PnlTick, Subaccount, Trade, TradeHistory,
-    Transfer, TransferParty,
+    OrderTicket, ParentSubaccount, PerpetualMarket, PerpetualPosition, PnlTick, Subaccount, Trade,
+    TradeHistory, Transfer, TransferParty, TwapProgress,
 };
 use crate::time::iso;
 
@@ -143,17 +145,22 @@ impl MarketView {
         // Sizes and prices are integers with 9 decimals on chain.
         let raw = |value: &BigDecimal| (value * pow10(9)).to_i64().unwrap_or(i64::MAX);
         let open_interest = plain(&self.row.open_interest);
+        let mark_price = plain(&self.valuation.mark_price);
         PerpetualMarket {
             clob_pair_id: self.index.to_string(),
             ticker: self.ticker.clone(),
             status: self.status(),
-            oracle_price: plain(&self.valuation.mark_price),
+            oracle_price: mark_price.clone(),
+            mark_price,
+            index_price: plain(&self.pricing.index_price),
             price_change_24h: plain(&price_change),
             volume_24h: stats
                 .map(|s| plain(&s.volume))
                 .unwrap_or_else(|| "0".into()),
             trades_24h: stats.map(|s| s.trades).unwrap_or_default(),
             next_funding_rate: plain(&self.pricing.funding_rate_1h()),
+            next_funding_at: iso(self.pricing.next_funding_ms()),
+            funding_period_ms: self.pricing.funding_period_ms,
             initial_margin_fraction: plain(&self.row.margin_ratio_initial),
             maintenance_margin_fraction: plain(&self.row.margin_ratio_maintenance),
             open_interest: open_interest.clone(),
@@ -491,6 +498,78 @@ pub fn pnl_tick_object(row: &PnlTickRow) -> PnlTick {
     }
 }
 
+/// The `ProcessedTWAPOrderTicket` event as the indexer stored it: raw engine integers.
+#[derive(Deserialize)]
+struct StoredTwapProgress {
+    execution_amount: u64,
+    filled_amount: u64,
+    remainder: u64,
+    processed_amount: u64,
+    scheduled_amount: u64,
+    last_attempt_timestamp_ms: u64,
+    last_execution_timestamp_ms: u64,
+}
+
+/// A stop or TWAP ticket of the account that is parent subaccount `parent`. A ticket on a
+/// listed market belongs to that market's child subaccount, as its orders would.
+pub fn ticket_object(row: &OrderTicketRow, ticker: Option<&str>, parent: i64) -> OrderTicket {
+    // Sizes are integers with 9 decimals on chain, gas is in HANEUL's smallest unit.
+    let base_units = |raw: u64| plain(&(BigDecimal::from(raw) / pow10(9)));
+    let timestamp = |ms: u64| (ms != 0).then(|| iso(ms.min(i64::MAX as u64) as i64));
+    let twap_progress = row
+        .twap_progress
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<StoredTwapProgress>(value.clone()).ok())
+        .map(|p| TwapProgress {
+            execution_amount: base_units(p.execution_amount),
+            filled_amount: base_units(p.filled_amount),
+            remainder: base_units(p.remainder),
+            processed_amount: base_units(p.processed_amount),
+            scheduled_amount: base_units(p.scheduled_amount),
+            last_attempt_at: timestamp(p.last_attempt_timestamp_ms),
+            last_execution_at: timestamp(p.last_execution_timestamp_ms),
+        });
+    let executors = row
+        .executors
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|executor| executor.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    OrderTicket {
+        id: row.ticket_id.clone(),
+        ticket_type: if row.kind == "twap" { "TWAP" } else { "STOP" },
+        status: match row.status.as_str() {
+            "executed" => "EXECUTED",
+            "finalized" => "FINALIZED",
+            "canceled" => "CANCELED",
+            "deleted" => "DELETED",
+            // The indexer writes no other status.
+            _ => "OPEN",
+        },
+        ticker: ticker.map(str::to_owned),
+        stop_order_type: row.stop_order_type.as_ref().map(plain),
+        executors,
+        execution_domain: row.execution_domain.clone(),
+        gas: plain(&(&row.gas / pow10(9))),
+        encrypted_details: row
+            .encrypted_details
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        twap_progress,
+        created_at: iso(row.created_at_ms),
+        created_at_height: height(row.created_checkpoint),
+        updated_at: iso(row.updated_at_ms),
+        updated_at_height: height(row.updated_checkpoint),
+        subaccount_number: row
+            .market_index
+            .map_or(parent, |index| child_number(parent, index)),
+    }
+}
+
 pub fn historical_pnl_tick_object(row: &PnlTickRow) -> HistoricalPnlTick {
     HistoricalPnlTick {
         equity: plain(&row.equity),
@@ -542,6 +621,8 @@ impl Child {
         };
         let margin = position.margin(&market.valuation);
         let balance = &margin.collateral_value - &row.quote_notional;
+        let liquidation_price =
+            position.liquidation_price(&margin, &market.row.margin_ratio_maintenance);
 
         let open = !row.base.is_zero();
         let object = (open || row.opened_checkpoint.is_some()).then(|| PerpetualPosition {
@@ -557,7 +638,9 @@ impl Child {
             sum_open: plain(&row.sum_open),
             sum_close: plain(&row.sum_close),
             net_funding: plain(&(&row.net_funding + &margin.unsettled_funding)),
+            unsettled_funding: plain(&margin.unsettled_funding),
             unrealized_pnl: plain(&margin.unrealized_pnl),
+            liquidation_price: liquidation_price.as_ref().map(plain),
             closed_at: (!open).then(|| iso(row.updated_at_ms)),
             exit_price: (!row.sum_close.is_zero())
                 .then(|| plain(&ratio(&row.close_quote, &row.sum_close))),
@@ -695,6 +778,8 @@ pub fn parent_subaccount(
 mod tests {
     use std::str::FromStr;
 
+    use serde_json::json;
+
     use super::*;
 
     fn dec(s: &str) -> BigDecimal {
@@ -797,6 +882,13 @@ mod tests {
         assert_eq!(market.clob_pair_id, "2");
         assert_eq!(market.status, "ACTIVE");
         assert_eq!(market.oracle_price, "100");
+        assert_eq!(
+            (market.mark_price.as_str(), market.index_price.as_str()),
+            ("100", "100")
+        );
+        // Funding was last updated at the first hour and runs hourly over a day.
+        assert_eq!(market.next_funding_at, "1970-01-01T02:00:00.000Z");
+        assert_eq!(market.funding_period_ms, 86_400_000);
         assert_eq!(market.tick_size, "1");
         assert_eq!(market.step_size, "0.001");
         assert_eq!(market.step_base_quantums, 1_000_000);
@@ -1044,10 +1136,22 @@ mod tests {
         assert_eq!(position.entry_price, "105");
         assert_eq!(position.unrealized_pnl, "-10");
         assert_eq!(position.net_funding, "-1.25");
+        assert_eq!(position.unsettled_funding, "-1");
+        // 999 of collateral value covers the 210 notional: no price liquidates it.
+        assert_eq!(position.liquidation_price, None);
         assert_eq!(position.exit_price.as_deref(), Some("120"));
         assert_eq!(position.created_at_height, "4");
         assert_eq!(position.subaccount_number, 384);
         assert!(child.is_open() && child.is_live());
+
+        // On 20 of collateral (19 after the funding owed): 19 + 2p - 210 = 0.1p at 191 / 1.9.
+        let mut thin = position_row("2", "210");
+        thin.collateral = dec("20");
+        let thin = Child::new(&thin, &market, 0);
+        assert_eq!(
+            thin.position.unwrap().liquidation_price.as_deref(),
+            Some("100.52631578947368421")
+        );
 
         let short = Child::new(&position_row("-2", "-210"), &market, 0);
         assert_eq!(short.position.as_ref().unwrap().side, "SHORT");
@@ -1157,6 +1261,85 @@ mod tests {
         assert_eq!(withdrawal.transfer_type, "WITHDRAWAL");
         assert_eq!(withdrawal.sender.subaccount_number, Some(2));
         assert_eq!(withdrawal.id, None);
+    }
+
+    #[test]
+    fn tickets_belong_to_their_market_and_report_twap_progress_in_base_units() {
+        let twap = OrderTicketRow {
+            ticket_id: "0xt".to_owned(),
+            kind: "twap".to_owned(),
+            market: Some("0xm".to_owned()),
+            market_index: Some(2),
+            status: "open".to_owned(),
+            executors: json!(["0xe1", "0xe2"]),
+            execution_domain: None,
+            gas: dec("1500000000"),
+            stop_order_type: None,
+            encrypted_details: vec![0xde, 0xad],
+            twap_progress: Some(json!({
+                "ticket_id": "0xt",
+                "account_id": 7,
+                "execution_amount": 500_000_000,
+                "filled_amount": 250_000_000,
+                "remainder": 250_000_000,
+                "processed_amount": 250_000_000,
+                "scheduled_amount": 500_000_000,
+                "last_attempt_timestamp_ms": 1_000,
+                "retry_anchor_timestamp_ms": 0,
+                "last_execution_timestamp_ms": 0,
+            })),
+            created_checkpoint: 3,
+            created_at_ms: 3_000,
+            updated_checkpoint: 8,
+            updated_at_ms: 8_000,
+        };
+        let ticket = ticket_object(&twap, Some("BTC-USD"), 3);
+        assert_eq!((ticket.ticket_type, ticket.status), ("TWAP", "OPEN"));
+        assert_eq!(ticket.ticker.as_deref(), Some("BTC-USD"));
+        assert_eq!(ticket.subaccount_number, 387);
+        assert_eq!(ticket.executors, ["0xe1", "0xe2"]);
+        assert_eq!(
+            (ticket.gas.as_str(), ticket.encrypted_details.as_str()),
+            ("1.5", "dead")
+        );
+        assert_eq!(
+            (
+                ticket.created_at_height.as_str(),
+                ticket.updated_at.as_str()
+            ),
+            ("3", "1970-01-01T00:00:08.000Z")
+        );
+        let progress = ticket.twap_progress.unwrap();
+        assert_eq!(
+            (
+                progress.execution_amount.as_str(),
+                progress.filled_amount.as_str()
+            ),
+            ("0.5", "0.25")
+        );
+        assert_eq!(
+            progress.last_attempt_at.as_deref(),
+            Some("1970-01-01T00:00:01.000Z")
+        );
+        assert_eq!(progress.last_execution_at, None);
+
+        // A stop ticket names no market until it executes, so it is the parent's.
+        let stop = OrderTicketRow {
+            kind: "stop".to_owned(),
+            market: None,
+            market_index: None,
+            status: "executed".to_owned(),
+            executors: json!([]),
+            stop_order_type: Some(dec("1")),
+            twap_progress: None,
+            ..twap
+        };
+        let ticket = ticket_object(&stop, None, 3);
+        assert_eq!((ticket.ticket_type, ticket.status), ("STOP", "EXECUTED"));
+        assert_eq!(ticket.stop_order_type.as_deref(), Some("1"));
+        assert!(ticket.ticker.is_none() && ticket.executors.is_empty());
+        assert_eq!(ticket.subaccount_number, 3);
+        assert_eq!(ticket.twap_progress, None);
     }
 
     #[test]

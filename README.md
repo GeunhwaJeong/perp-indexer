@@ -145,8 +145,19 @@ end's own arithmetic stays true.
   funding accrued and not yet settled, minus what the position cost, so that balance plus
   position value at the mark price is the engine's margin.
 - **Prices.** `oraclePrice` is the engine's mark price, which is what positions are valued and
-  liquidated at. It, accrued funding and the value of collateral are the only numbers computed
-  here rather than copied; `crates/engine` restates the engine's formulas for them.
+  liquidated at; `markPrice` carries it under its own name, and `indexPrice` is the base
+  asset's oracle price. They, accrued funding and the value of collateral are the only numbers
+  computed here rather than copied; `crates/engine` restates the engine's formulas for them.
+  A market also says when funding is next updated (`nextFundingAt`) and how long one funding
+  period is (`fundingPeriodMs`), since `nextFundingRate` is per hour.
+- **Positions.** Beside the protocol's fields, a position says what funding it has accrued
+  since it was last settled (`unsettledFunding`, included in `netFunding`), and the mark price
+  at which its margin meets the maintenance requirement (`liquidationPrice`, `null` when no
+  price does), both as the engine would compute them with its resting orders counted.
+- **Order tickets.** `/v4/orderTickets/parentSubaccountNumber` lists an account's stop and
+  TWAP tickets (`type`, `status` and `ticker` filter them). The engine holds a ticket's order
+  details encrypted, so a ticket says who may execute it, what gas it carries and, for a TWAP,
+  how far it has run; the details themselves are the client's to keep.
 - **Amounts.** Balances are in USD at the collateral's oracle price. Deposits and withdrawals are
   in coins. The quote asset is presented as `USDC`, the symbol the front end knows.
 - **Orders.** An order that rests on the book is a `LIMIT` order whose `id` is the engine's

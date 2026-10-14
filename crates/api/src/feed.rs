@@ -589,10 +589,14 @@ mod tests {
             ticker: ticker.to_owned(),
             status: "ACTIVE",
             oracle_price: price.to_owned(),
+            mark_price: price.to_owned(),
+            index_price: price.to_owned(),
             price_change_24h: "0".to_owned(),
             volume_24h: "0".to_owned(),
             trades_24h: 0,
             next_funding_rate: "0".to_owned(),
+            next_funding_at: "1970-01-01T01:00:00.000Z".to_owned(),
+            funding_period_ms: 86_400_000,
             initial_margin_fraction: "0.1".to_owned(),
             maintenance_margin_fraction: "0.05".to_owned(),
             open_interest: open_interest.to_owned(),
@@ -630,7 +634,12 @@ mod tests {
         assert_eq!(
             update(&before, &after),
             Some(json!({
-                "trading": {"BTC-USD": {"openInterest": "6", "baseOpenInterest": "6"}},
+                "trading": {"BTC-USD": {
+                    "openInterest": "6",
+                    "baseOpenInterest": "6",
+                    "markPrice": "101",
+                    "indexPrice": "101",
+                }},
                 "oraclePrices": {"BTC-USD": {
                     "oraclePrice": "101",
                     "effectiveAt": "1970-01-01T00:00:00.000Z",
@@ -640,11 +649,14 @@ mod tests {
             }))
         );
 
-        // A price move alone is an oracle price update.
+        // A price move is an oracle price update, and the prices under their own names.
         let mut repriced = before.clone();
         repriced.insert("BTC-USD".to_owned(), market("BTC-USD", "99", "5"));
         let sent = update(&before, &repriced).unwrap();
-        assert!(sent.get("trading").is_none());
+        assert_eq!(
+            sent["trading"]["BTC-USD"],
+            json!({"markPrice": "99", "indexPrice": "99"})
+        );
         assert_eq!(sent["oraclePrices"]["BTC-USD"]["oraclePrice"], "99");
     }
 

@@ -7,7 +7,7 @@
 //! feed) is read through a [`Snapshot`].
 
 use bigdecimal::BigDecimal;
-use diesel::sql_types::{Array, BigInt, Bool, Nullable, Numeric, SmallInt, Text};
+use diesel::sql_types::{Array, BigInt, Bool, Bytea, Jsonb, Nullable, Numeric, SmallInt, Text};
 use diesel::{QueryableByName, sql_query};
 use diesel_async::{AsyncConnection, RunQueryDsl, TransactionManager};
 use haneul_pg_db::{Connection, Db};
@@ -1108,4 +1108,83 @@ pub async fn account_pnl_ticks(
         .bind::<BigInt, _>(filter.limit)
         .load(conn)
         .await?)
+}
+
+/// A stop or TWAP order ticket of an account.
+#[derive(Clone, Debug, QueryableByName)]
+pub struct OrderTicketRow {
+    #[diesel(sql_type = Text)]
+    pub ticket_id: String,
+    /// 'stop' or 'twap'.
+    #[diesel(sql_type = Text)]
+    pub kind: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub market: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub market_index: Option<i64>,
+    /// 'open', 'executed', 'finalized', 'canceled' or 'deleted'.
+    #[diesel(sql_type = Text)]
+    pub status: String,
+    /// The addresses that may execute the ticket.
+    #[diesel(sql_type = Jsonb)]
+    pub executors: serde_json::Value,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub execution_domain: Option<String>,
+    /// In HANEUL's smallest unit.
+    #[diesel(sql_type = Numeric)]
+    pub gas: BigDecimal,
+    #[diesel(sql_type = Nullable<Numeric>)]
+    pub stop_order_type: Option<BigDecimal>,
+    #[diesel(sql_type = Bytea)]
+    pub encrypted_details: Vec<u8>,
+    /// The last `ProcessedTWAPOrderTicket` event, as the indexer stored it.
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    pub twap_progress: Option<serde_json::Value>,
+    #[diesel(sql_type = BigInt)]
+    pub created_checkpoint: i64,
+    #[diesel(sql_type = BigInt)]
+    pub created_at_ms: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_checkpoint: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TicketFilter {
+    /// 'stop' or 'twap'.
+    pub kind: Option<String>,
+    pub status: Option<String>,
+    pub market: Option<String>,
+    pub limit: i64,
+}
+
+/// An account's tickets, newest first. A stop ticket names no market until it executes, so
+/// every stop ticket is the account's; a TWAP ticket is listed when its market is.
+pub async fn account_order_tickets(
+    conn: &mut Connection<'_>,
+    market_ids: &[String],
+    account_id: i64,
+    filter: &TicketFilter,
+) -> anyhow::Result<Vec<OrderTicketRow>> {
+    Ok(sql_query(
+        "SELECT t.ticket_id, t.kind, t.market, m.market_index, t.status, t.executors, \
+                t.execution_domain, t.gas, t.stop_order_type, t.encrypted_details, \
+                t.twap_progress, t.created_checkpoint, t.created_at_ms, t.updated_checkpoint, \
+                t.updated_at_ms \
+         FROM order_tickets t LEFT JOIN markets m ON m.market = t.market \
+         WHERE t.account_id = $1 AND (t.market IS NULL OR t.market = ANY($2)) \
+           AND ($3::TEXT IS NULL OR t.kind = $3) \
+           AND ($4::TEXT IS NULL OR t.status = $4) \
+           AND ($5::TEXT IS NULL OR t.market = $5) \
+         ORDER BY t.created_checkpoint DESC, t.ticket_id LIMIT $6",
+    )
+    .bind::<BigInt, _>(account_id)
+    .bind::<Array<Text>, _>(market_ids)
+    .bind::<Nullable<Text>, _>(&filter.kind)
+    .bind::<Nullable<Text>, _>(&filter.status)
+    .bind::<Nullable<Text>, _>(&filter.market)
+    .bind::<BigInt, _>(filter.limit)
+    .load(conn)
+    .await?)
 }

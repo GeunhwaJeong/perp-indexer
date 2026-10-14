@@ -16,7 +16,12 @@ pub struct PerpetualMarket {
     pub clob_pair_id: String,
     pub ticker: String,
     pub status: &'static str,
+    /// The engine's mark price: the protocol's name for the price positions are valued at.
     pub oracle_price: String,
+    /// The same price under its own name.
+    pub mark_price: String,
+    /// The base asset's oracle price, which the engine calls the index price.
+    pub index_price: String,
     #[serde(rename = "priceChange24H")]
     pub price_change_24h: String,
     #[serde(rename = "volume24H")]
@@ -24,6 +29,11 @@ pub struct PerpetualMarket {
     #[serde(rename = "trades24H")]
     pub trades_24h: i64,
     pub next_funding_rate: String,
+    /// When funding is next updated.
+    pub next_funding_at: String,
+    /// The period one funding payment covers: the rate over it is `nextFundingRate` times
+    /// its hours.
+    pub funding_period_ms: i64,
     pub initial_margin_fraction: String,
     pub maintenance_margin_fraction: String,
     pub open_interest: String,
@@ -142,11 +152,61 @@ pub struct PerpetualPosition {
     pub created_at_height: String,
     pub sum_open: String,
     pub sum_close: String,
+    /// Funding settled and accrued since the position was opened; positive when received.
     pub net_funding: String,
+    /// The part of `netFunding` accrued since the position was last settled: what the next
+    /// session on the market will move.
+    pub unsettled_funding: String,
     pub unrealized_pnl: String,
+    /// The mark price at which the position becomes liquidatable; `null` when no price does.
+    pub liquidation_price: Option<String>,
     pub closed_at: Option<String>,
     pub exit_price: Option<String>,
     pub subaccount_number: i64,
+}
+
+/// A stop or TWAP order ticket. The engine holds a ticket's order details encrypted, so what
+/// is known is its lifecycle, who may execute it and, for a TWAP, how far it has run.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderTicket {
+    pub id: String,
+    /// `STOP` or `TWAP`.
+    #[serde(rename = "type")]
+    pub ticket_type: &'static str,
+    /// `OPEN`, `EXECUTED`, `FINALIZED`, `CANCELED` or `DELETED`.
+    pub status: &'static str,
+    /// A TWAP names its market when created; a stop order only when executed.
+    pub ticker: Option<String>,
+    pub stop_order_type: Option<String>,
+    pub executors: Vec<String>,
+    pub execution_domain: Option<String>,
+    /// HANEUL deposited for the executors' gas.
+    pub gas: String,
+    /// Hex, as the ticket holds it.
+    pub encrypted_details: String,
+    pub twap_progress: Option<TwapProgress>,
+    pub created_at: String,
+    pub created_at_height: String,
+    pub updated_at: String,
+    pub updated_at_height: String,
+    pub subaccount_number: i64,
+}
+
+/// Where a TWAP stood after its last execution step, in base units.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwapProgress {
+    /// The size the last step tried to execute, and what of it filled.
+    pub execution_amount: String,
+    pub filled_amount: String,
+    /// Scheduled but not yet filled.
+    pub remainder: String,
+    /// Filled so far, and scheduled so far.
+    pub processed_amount: String,
+    pub scheduled_amount: String,
+    pub last_attempt_at: Option<String>,
+    pub last_execution_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

@@ -660,12 +660,21 @@ async function checkPublicRest(late, probe) {
     const id = market.market;
     check(`rest: ${ticker} is numbered by the indexer`, markets[ticker].clobPairId === String(market.market_index));
 
-    // The book against the open orders it is made of.
+    // The book against the orders it is made of: the open ones that take fills at the chain
+    // time the tables are at. An order past its expiry stays open until a taker reaches it.
     const book = await rest(`/v4/orderbooks/perpetualMarket/${ticker}`);
-    const levels = sql(`SELECT is_ask, trim_scale(price)::text AS price, trim_scale(SUM(remaining))::text AS size FROM orders WHERE market = '${id}' AND status = 'open' GROUP BY is_ask, price ORDER BY price`);
+    const now = `(SELECT timestamp_ms_hi_inclusive FROM watermarks WHERE pipeline = 'state')`;
+    const levels = sql(`SELECT is_ask, trim_scale(price)::text AS price, trim_scale(SUM(remaining))::text AS size FROM orders WHERE market = '${id}' AND status = 'open' AND (expiration_timestamp_ms IS NULL OR expiration_timestamp_ms > ${now}) GROUP BY is_ask, price ORDER BY price`);
     const side = (isAsk) => levels.filter((l) => l.is_ask === isAsk).map(({ price, size }) => ({ price, size }));
-    same(`rest: ${ticker} asks are the open asks, best first`, book.asks, side(true));
-    same(`rest: ${ticker} bids are the open bids, best first`, book.bids, side(false).reverse());
+    same(`rest: ${ticker} asks are the open asks that take fills, best first`, book.asks, side(true));
+    same(`rest: ${ticker} bids are the open bids that take fills, best first`, book.bids, side(false).reverse());
+    if (probe) {
+      // The scenario leaves an order on the book past its expiry.
+      const expired = sql(`SELECT trim_scale(price)::text AS price FROM orders WHERE market = '${id}' AND status = 'open' AND expiration_timestamp_ms <= ${now}`);
+      const shown = [...book.bids, ...book.asks].map((l) => l.price);
+      check(`rest: ${ticker} the order past its expiry is still open in the table`, expired.length > 0);
+      check(`rest: ${ticker} the book leaves out the order past its expiry`, expired.every((o) => !shown.includes(o.price)), JSON.stringify({ expired, shown }));
+    }
     const flat = (levels) => Object.fromEntries(levels.map((l) => [l.price, l.size]));
     same(`stream: ${ticker} book equals the open orders`, late.books[ticker], { bids: flat(book.bids), asks: flat(book.asks) });
 

@@ -8,6 +8,10 @@
 //! round. It reads by checkpoint range rather than being told what changed, so it needs nothing
 //! from the indexer but its tables, survives restarts of either side, and can run in several
 //! API processes over one database.
+//!
+//! The expiry of an order writes nothing: the order stays open in the tables until a taker
+//! reaches it. A round therefore also covers a span of chain time, and states anew the book
+//! levels of the orders that expired in it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -83,6 +87,8 @@ pub struct Feed {
     config: FeedConfig,
     /// The checkpoint published up to.
     checkpoint: i64,
+    /// The chain time of that checkpoint, in milliseconds: the time the books are stated at.
+    timestamp_ms: i64,
     /// The markets as subscribers last saw them.
     markets: Markets,
     markets_sent: Instant,
@@ -111,6 +117,7 @@ impl Feed {
             deployment,
             config,
             checkpoint: 0,
+            timestamp_ms: 0,
             markets: Markets::new(),
             markets_sent: Instant::now(),
             stats: HashMap::new(),
@@ -177,7 +184,7 @@ impl Feed {
         };
         let views = market_views(conn, &self.deployment, watermark.timestamp_ms).await?;
         let stats = db::market_stats(conn, &market_ids, watermark.timestamp_ms).await?;
-        let levels = db::book_levels(conn, &market_ids).await?;
+        let levels = db::book_levels(conn, &market_ids, watermark.timestamp_ms).await?;
         let trades = db::recent_trades(conn, &market_ids, RECENT_TRADES as i64).await?;
         snapshot.finish().await?;
 
@@ -187,6 +194,7 @@ impl Feed {
         self.markets_sent = Instant::now();
         self.funding = funding_rates(&views);
         self.checkpoint = watermark.checkpoint;
+        self.timestamp_ms = watermark.timestamp_ms;
 
         let mut state = PublicState {
             checkpoint: watermark.checkpoint,
@@ -270,7 +278,8 @@ impl Feed {
         } else {
             None
         };
-        let levels = db::changed_levels(conn, &market_ids, lo, hi).await?;
+        let (was_ms, now_ms) = (self.timestamp_ms, watermark.timestamp_ms);
+        let levels = db::changed_levels(conn, &market_ids, lo, hi, was_ms, now_ms).await?;
         let fills = db::changed_fills(conn, &market_ids, &watched, lo, hi).await?;
 
         let starts: Vec<i64> = fills
@@ -339,6 +348,7 @@ impl Feed {
             self.markets_sent = Instant::now();
         }
         self.checkpoint = watermark.checkpoint;
+        self.timestamp_ms = watermark.timestamp_ms;
         self.observe(watermark);
         self.hub.publish(round, update);
         Ok(Step::Published)

@@ -227,43 +227,72 @@ pub struct LevelRow {
     pub size: BigDecimal,
 }
 
-/// Every level of the listed markets' books.
+/// The condition under which a row of `orders` takes fills at the chain time `now`, a query
+/// parameter in milliseconds. `column` prefixes the column names, as `o.` does for an alias.
+///
+/// An order stays `open` after its expiry: the engine cancels it only when a taker reaches it,
+/// and nothing is written until then. The engine takes an order as expired once its clock is at
+/// the expiry or past it, and fills none of it from then on.
+fn takes_fills(column: &str, now: &str) -> String {
+    format!(
+        "{column}status = 'open' AND ({column}expiration_timestamp_ms IS NULL \
+         OR {column}expiration_timestamp_ms > {now})"
+    )
+}
+
+/// Every level of the listed markets' books at the chain time `now_ms`: the orders that take
+/// fills then.
 pub async fn book_levels(
     conn: &mut Connection<'_>,
     market_ids: &[String],
+    now_ms: i64,
 ) -> anyhow::Result<Vec<LevelRow>> {
-    Ok(sql_query(
+    Ok(sql_query(format!(
         "SELECT market, is_ask, price, SUM(remaining) AS size FROM orders \
-         WHERE status = 'open' AND market = ANY($1) \
+         WHERE {} AND market = ANY($1) \
          GROUP BY market, is_ask, price",
-    )
+        takes_fills("", "$2"),
+    ))
     .bind::<Array<Text>, _>(market_ids)
+    .bind::<BigInt, _>(now_ms)
     .load(conn)
     .await?)
 }
 
-/// The levels that orders updated in `(lo, hi]` rest or rested at, with their size now. A level
-/// that emptied comes back with size zero.
+/// The levels whose size changed between two views of the book, with their size in the later
+/// one. The earlier view is at checkpoint `lo` and chain time `was_ms`, the later one at `hi`
+/// and `now_ms`. A level changes when an order at it was updated in `(lo, hi]`, and when the
+/// expiry of an open order at it fell in `(was_ms, now_ms]`. A level that emptied comes back
+/// with size zero.
 pub async fn changed_levels(
     conn: &mut Connection<'_>,
     market_ids: &[String],
     lo: i64,
     hi: i64,
+    was_ms: i64,
+    now_ms: i64,
 ) -> anyhow::Result<Vec<LevelRow>> {
-    Ok(sql_query(
+    Ok(sql_query(format!(
         "WITH touched AS ( \
-             SELECT DISTINCT market, is_ask, price FROM orders \
-              WHERE updated_checkpoint > $2 AND updated_checkpoint <= $3 AND market = ANY($1)) \
+             SELECT market, is_ask, price FROM orders \
+              WHERE updated_checkpoint > $2 AND updated_checkpoint <= $3 AND market = ANY($1) \
+             UNION \
+             SELECT market, is_ask, price FROM orders \
+              WHERE status = 'open' AND market = ANY($1) \
+                AND expiration_timestamp_ms > $4 AND expiration_timestamp_ms <= $5) \
          SELECT t.market, t.is_ask, t.price, COALESCE(SUM(o.remaining), 0) AS size \
          FROM touched t \
          LEFT JOIN orders o \
                 ON o.market = t.market AND o.is_ask = t.is_ask AND o.price = t.price \
-               AND o.status = 'open' \
+               AND {} \
          GROUP BY t.market, t.is_ask, t.price",
-    )
+        takes_fills("o.", "$5"),
+    ))
     .bind::<Array<Text>, _>(market_ids)
     .bind::<BigInt, _>(lo)
     .bind::<BigInt, _>(hi)
+    .bind::<BigInt, _>(was_ms)
+    .bind::<BigInt, _>(now_ms)
     .load(conn)
     .await?)
 }

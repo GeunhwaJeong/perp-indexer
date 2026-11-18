@@ -23,7 +23,8 @@ produce a change, for checks that need one after the scenario has finished.
 then sets up a market and produces, while the indexer is following the chain: administrator
 parameter changes, integrator fees, stop order and TWAP tickets through every step of their
 life, a liquidation whose bad debt is socialized, a funding update that is settled for one
-account and left accrued for the others, and an auto-deleveraging.
+account and left accrued for the others, an auto-deleveraging, and an order that is left on
+the book past its expiry.
 
 Reuses the helpers of the engine's own suite (`<checkout>/e2e/localnet_e2e.py`), which must
 point at the checkout the packages are published from. Needs a running localnet, the CLI on the
@@ -39,6 +40,8 @@ import time
 from pathlib import Path
 
 STATE_FILE = Path(".localnet-scenario.json")
+# How long the scenario's expiring order lives, in seconds.
+EXPIRY_SECS = 6
 
 
 def load_lib(perp_dex):
@@ -334,8 +337,9 @@ def run(lib, deployment_path=None, gate_path=None, probe_path=None):
         cmds += call(f"{PERP}::clearing_house::share", [TUSD], "res.0")
         return ptb(label, cmds, expect_abort=expect_abort)
 
-    def limit(side, size, price, otype=GTC, reduce_only=False):
-        return call(f"{PERP}::clearing_house::place_limit_order", [TUSD], "hp", b(side), u64(size), u64(price), u64(otype), "none", b(reduce_only), "none")
+    def limit(side, size, price, otype=GTC, reduce_only=False, expires_ms=None):
+        expiry = f"some({u64(expires_ms)})" if expires_ms else "none"
+        return call(f"{PERP}::clearing_house::place_limit_order", [TUSD], "hp", b(side), u64(size), u64(price), u64(otype), "none", b(reduce_only), expiry)
 
     def market_order(side, size, reduce_only=False):
         return call(f"{PERP}::clearing_house::place_market_order", [TUSD], "hp", b(side), u64(size), b(reduce_only))
@@ -512,6 +516,18 @@ def run(lib, deployment_path=None, gate_path=None, probe_path=None):
     cmds += call(f"{PERP}::adl::execute_adl", [TUSD], obj(ch), obj(adl_cap), obj(registry), u64(acct["T"]["id"]), "open_orders", "counterparties", "sizes", "weights", obj(pfs_btc), obj(pfs_tusd), CLOCK)
     j = ptb("ADL closes T against M at 30,000", cmds)
     check("PerformedADL emitted", len(events(j, "::events::PerformedADL")) == 1)
+
+    # ------------------------------------------------------------ an order that expires
+    section("An order that expires")
+    # The engine cancels an expired order only when a taker reaches it, and the expiry itself
+    # writes nothing: the order stays on the book and takes no fills. It is left there for the
+    # checks that run after the scenario. With no ask on the book it does not move the mark
+    # price.
+    expires_ms = int(time.time() * 1000) + EXPIRY_SECS * 1000
+    j = session("M rests a bid that expires", "M", [limit(BID, 50_000_000, px(29_000), expires_ms=expires_ms)])
+    posted = events(j, "::events::PostedOrder")
+    check("the bid with an expiry rests", len(posted) == 1 and int(posted[0]["expiration_timestamp_ms"]) == expires_ms, str(posted))
+    time.sleep(EXPIRY_SECS + 3)
 
     if probe_path:
         # What the engine itself says, without touching the chain: the mark price as of now and
